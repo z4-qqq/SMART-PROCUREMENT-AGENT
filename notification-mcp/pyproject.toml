@@ -1,0 +1,16 @@
+[project]
+name = "supplier-pricing-mcp"
+version = "0.1.0"
+description = "MCP сервер для поиска товаров и подбора офферов поставщиков"
+requires-python = ">=3.12"
+
+dependencies = [
+  "fastmcp",
+  "modelcontextprotocol",
+  "httpx",
+  "pydantic>=2.0.0",
+  "python-dotenv",
+  "prometheus-client",
+  "opentelemetry-sdk",
+  "opentelemetry-api",
+]

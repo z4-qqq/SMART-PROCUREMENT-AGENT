@@ -1,0 +1,30 @@
+{
+  "rawEnvs": {
+    "SUPPLIER_API_BASE": {
+      "isRequired": false,
+      "description": "Базовый URL публичного API поставщика",
+      "defaultValue": "https://fakestoreapi.com"
+    },
+    "SUPPLIER_DEFAULT_CURRENCY": {
+      "isRequired": false,
+      "description": "Код валюты каталога (ISO 4217)",
+      "defaultValue": "USD"
+    },
+    "SUPPLIER_HTTP_TIMEOUT": {
+      "isRequired": false,
+      "description": "Таймаут HTTP-запросов к API в секундах",
+      "defaultValue": "10.0"
+    },
+    "HOST": {
+      "isRequired": false,
+      "description": "Адрес MCP сервера",
+      "defaultValue": "0.0.0.0"
+    },
+    "PORT": {
+      "isRequired": false,
+      "description": "Порт MCP сервера",
+      "defaultValue": "8000"
+    }
+  },
+  "secretEnvs": {}
+}

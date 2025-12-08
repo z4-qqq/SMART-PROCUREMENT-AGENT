@@ -1,0 +1,30 @@
+{
+  "rawEnvs": {
+    "FX_API_BASE": {
+      "isRequired": false,
+      "description": "Базовый URL публичного FX API",
+      "defaultValue": "https://api.exchangerate.host/latest"
+    },
+    "FX_HTTP_TIMEOUT": {
+      "isRequired": false,
+      "description": "Таймаут HTTP-запросов к FX API (в секундах)",
+      "defaultValue": "10.0"
+    },
+    "FX_DEFAULT_BASE_CURRENCY": {
+      "isRequired": false,
+      "description": "Базовая валюта по умолчанию",
+      "defaultValue": "RUB"
+    },
+    "HOST": {
+      "isRequired": false,
+      "description": "Адрес MCP сервера",
+      "defaultValue": "0.0.0.0"
+    },
+    "PORT": {
+      "isRequired": false,
+      "description": "Порт MCP сервера",
+      "defaultValue": "8001"
+    }
+  },
+  "secretEnvs": {}
+}

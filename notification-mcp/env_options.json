@@ -1,0 +1,20 @@
+{
+  "rawEnvs": {
+    "NOTIFICATION_HTTP_TIMEOUT": {
+      "isRequired": false,
+      "description": "Таймаут HTTP-запросов к вебхуку (в секундах)",
+      "defaultValue": "10.0"
+    },
+    "HOST": {
+      "isRequired": false,
+      "description": "Адрес MCP сервера",
+      "defaultValue": "0.0.0.0"
+    },
+    "PORT": {
+      "isRequired": false,
+      "description": "Порт MCP сервера",
+      "defaultValue": "8002"
+    }
+  },
+  "secretEnvs": {}
+}

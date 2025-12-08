@@ -1,0 +1,49 @@
+id: "supplier-pricing-mcp"
+name: "Supplier Pricing MCP"
+description: >
+  MCP-сервер для поиска товаров и подбора предложений поставщика
+  на основе публичного каталога (например, Fake Store API).
+
+tools:
+  - name: "search_products"
+    description: "Поиск товаров в каталоге поставщика."
+    parameters:
+      query: "string - Поисковый запрос по названию."
+      limit: "integer - Максимальное количество результатов."
+  - name: "get_offers_for_items"
+    description: "Подбор офферов по списку позиций закупки."
+    parameters:
+      items: "array - Список объектов PurchaseItem."
+      max_suppliers_per_item: "integer - Ограничение по количеству офферов."
+
+rawEnvs:
+  SUPPLIER_API_BASE:
+    isRequired: false
+    description: "Базовый URL публичного API поставщика."
+  SUPPLIER_DEFAULT_CURRENCY:
+    isRequired: false
+    description: "Код валюты каталога."
+  SUPPLIER_HTTP_TIMEOUT:
+    isRequired: false
+    description: "Таймаут HTTP-запросов (сек)."
+  PORT:
+    isRequired: false
+    description: "Порт MCP сервера."
+  HOST:
+    isRequired: false
+    description: "Адрес MCP сервера."
+
+secretEnvs: {}
+
+image_uri: ${IMAGE_URI}
+license_url: "https://example.com/license"
+tags: ["procurement", "pricing", "demo"]
+category: "Business automation"
+versions: ["1.0.0"]
+
+exposed_ports:
+  - port: 8000
+    protocol: "HTTP"
+
+status: "MCP_SERVER_PREDEFINED_STATUS_AVAILABLE"
+type: "MCP_SERVER_PREDEFINED_TYPE_INTERNAL"

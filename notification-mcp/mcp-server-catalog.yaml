@@ -1,0 +1,39 @@
+id: "notification-mcp"
+name: "Notification MCP"
+description: >
+  MCP-сервер для отправки планов закупок и других бизнес-уведомлений
+  на внешние вебхуки. Используется для live-demo и интеграций с внешними
+  системами (webhook.site, внутренние API и т.п.).
+
+tools:
+  - name: "send_procurement_plan_webhook"
+    description: "Отправка плана закупок на указанный URL методом POST (JSON)."
+    parameters:
+      url: "string - URL вебхука"
+      plan: "object - JSON-объект с планом закупок"
+
+rawEnvs:
+  NOTIFICATION_HTTP_TIMEOUT:
+    isRequired: false
+    description: "Таймаут HTTP-запросов к вебхуку (сек)."
+  HOST:
+    isRequired: false
+    description: "Адрес MCP сервера."
+  PORT:
+    isRequired: false
+    description: "Порт MCP сервера."
+
+secretEnvs: {}
+
+image_uri: ${IMAGE_URI}
+license_url: "https://example.com/license"
+tags: ["webhook", "notification", "procurement"]
+category: "Business automation"
+versions: ["1.0.0"]
+
+exposed_ports:
+  - port: 8002
+    protocol: "HTTP"
+
+status: "MCP_SERVER_PREDEFINED_STATUS_AVAILABLE"
+type: "MCP_SERVER_PREDEFINED_TYPE_INTERNAL"

@@ -1,0 +1,39 @@
+[
+  {
+    "name": "get_exchange_rate",
+    "description": "💱 Получить курс валюты base→quote из публичного FX API.",
+    "args": [
+      {
+        "name": "base",
+        "type": "string",
+        "description": "Базовая валюта (ISO 4217), например 'USD'."
+      },
+      {
+        "name": "quote",
+        "type": "string",
+        "description": "Целевая валюта (ISO 4217), например 'RUB'."
+      }
+    ]
+  },
+  {
+    "name": "convert_amount",
+    "description": "🔁 Конвертирует сумму из валюты base в валюту quote.",
+    "args": [
+      {
+        "name": "amount",
+        "type": "number",
+        "description": "Сумма для конвертации в базовой валюте."
+      },
+      {
+        "name": "base",
+        "type": "string",
+        "description": "Базовая валюта (ISO 4217)."
+      },
+      {
+        "name": "quote",
+        "type": "string",
+        "description": "Целевая валюта (ISO 4217)."
+      }
+    ]
+  }
+]

@@ -1,0 +1,51 @@
+id: "fx-rates-mcp"
+name: "FX Rates MCP"
+description: >
+  MCP-сервер для работы с валютными курсами: получение курса base→quote
+  и конвертация сумм. Используется агентом закупок для пересчёта бюджетов
+  и цен поставщиков.
+
+tools:
+  - name: "get_exchange_rate"
+    description: "Получение курса валют base→quote из публичного FX API."
+    parameters:
+      base: "string - Базовая валюта (ISO 4217)"
+      quote: "string - Целевая валюта (ISO 4217)"
+  - name: "convert_amount"
+    description: "Конвертация суммы из base в quote."
+    parameters:
+      amount: "number - Сумма в базовой валюте"
+      base: "string - Базовая валюта (ISO 4217)"
+      quote: "string - Целевая валюта (ISO 4217)"
+
+rawEnvs:
+  FX_API_BASE:
+    isRequired: false
+    description: "Базовый URL публичного FX API."
+  FX_HTTP_TIMEOUT:
+    isRequired: false
+    description: "Таймаут HTTP-запросов к FX API."
+  FX_DEFAULT_BASE_CURRENCY:
+    isRequired: false
+    description: "Базовая валюта по умолчанию."
+  HOST:
+    isRequired: false
+    description: "Адрес MCP сервера."
+  PORT:
+    isRequired: false
+    description: "Порт MCP сервера."
+
+secretEnvs: {}
+
+image_uri: ${IMAGE_URI}
+license_url: "https://example.com/license"
+tags: ["fx", "currency", "procurement"]
+category: "Business automation"
+versions: ["1.0.0"]
+
+exposed_ports:
+  - port: 8001
+    protocol: "HTTP"
+
+status: "MCP_SERVER_PREDEFINED_STATUS_AVAILABLE"
+type: "MCP_SERVER_PREDEFINED_TYPE_INTERNAL"
