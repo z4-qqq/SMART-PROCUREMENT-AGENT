@@ -1,0 +1,9 @@
+fastmcp
+mcp
+modelcontextprotocol
+httpx
+pydantic>=2.0
+python-dotenv
+prometheus-client
+opentelemetry-sdk
+opentelemetry-api

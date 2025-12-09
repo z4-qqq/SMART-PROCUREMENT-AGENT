@@ -1,0 +1,62 @@
+version: "3.9"
+
+services:
+  supplier-pricing-mcp:
+    build:
+      context: ./supplier-pricing-mcp
+      dockerfile: Dockerfile
+      network: host
+    container_name: supplier-pricing-mcp
+    env_file:
+      - ./supplier-pricing-mcp/.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+    network_mode: host
+
+  fx-rates-mcp:
+    build:
+      context: ./fx-rates-mcp
+      dockerfile: Dockerfile
+      network: host
+    container_name: fx-rates-mcp
+    env_file:
+      - ./fx-rates-mcp/.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8001
+    network_mode: host
+
+  notification-mcp:
+    build:
+      context: ./notification-mcp
+      dockerfile: Dockerfile
+      network: host
+    container_name: notification-mcp
+    env_file:
+      - ./notification-mcp/.env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8002
+    network_mode: host
+
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+      network: host
+    container_name: procurement-agent
+    env_file:
+      - ./agent/.env
+    environment:
+      # В host-сети все контейнеры разделяют сеть хоста,
+      # поэтому можно использовать localhost и те же порты
+      SUPPLIER_MCP_URL: http://127.0.0.1:8000/mcp
+      FX_MCP_URL: http://127.0.0.1:8001/mcp
+      NOTIFICATION_MCP_URL: http://127.0.0.1:8002/mcp
+      WEB_PORT: 8080
+    depends_on:
+      - supplier-pricing-mcp
+      - fx-rates-mcp
+      - notification-mcp
+    network_mode: host
