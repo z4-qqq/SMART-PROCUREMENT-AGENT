@@ -11,7 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from main import build_procurement_plan  # type: ignore
+from main import (  # type: ignore
+    build_procurement_plan,
+    build_procurement_plan_tools_agent,
+    summarize_plan_for_user,
+)
 
 load_dotenv()
 
@@ -22,6 +26,13 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="Smart Procurement Agent")
+
+# Режим работы агента: pipeline (по умолчанию) или tools-agent
+AGENT_MODE = os.getenv("AGENT_MODE", "pipeline").strip().lower()
+if AGENT_MODE not in ("pipeline", "tools-agent"):
+    logger.warning("Unknown AGENT_MODE=%s, fallback to 'pipeline'", AGENT_MODE)
+    AGENT_MODE = "pipeline"
+logger.info("Web app started with AGENT_MODE=%s", AGENT_MODE)
 
 # Если будешь открывать фронт с другого origin — CORS пригодится
 app.add_middleware(
@@ -207,6 +218,30 @@ HTML_PAGE = """
       flex-wrap: wrap;
     }
 
+    .bubble-body p {
+      margin: 4px 0;
+    }
+    .bubble-body ul,
+    .bubble-body ol {
+      margin: 4px 0 4px 18px;
+      padding-left: 18px;
+    }
+    .bubble-body h1,
+    .bubble-body h2,
+    .bubble-body h3 {
+      margin: 6px 0 4px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .bubble-body code {
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      background: rgba(15,23,42,0.9);
+      padding: 1px 4px;
+      border-radius: 4px;
+      border: 1px solid rgba(148,163,184,0.5);
+    }
+
     .bubble details {
       margin-top: 8px;
       background: rgba(15,23,42,0.9);
@@ -366,7 +401,7 @@ HTML_PAGE = """
     <header>
       <div class="title">
         <span>🤖 Smart Procurement Agent</span>
-        <span class="pill">MCP · Printful</span>
+        <span class="pill">MCP · Cloud</span>
       </div>
       <div class="status">
         <span class="dot"></span>
@@ -376,8 +411,8 @@ HTML_PAGE = """
 
     <main id="chat">
       <div class="system-note">
-        💡 Опиши, какой мерч или промо-товары нужно закупить (худи, футболки, кружки и т.п.), можно указать бюджет и вебхук.
-        Например: «Сделай мерч к конференции на 50 человек: худи, футболки и кружки, покажи итог в EUR и отправь план в мой вебхук https://example.com/hook».
+        💡 Опиши, что нужно закупить, и, при желании, добавь бюджет и вебхук для отправки плана.
+        Например: «Купи 50 худи, 50 футболок и 50 кружек к конференции, покажи итог в EUR и отправь план в мой вебхук».
       </div>
     </main>
 
@@ -385,7 +420,7 @@ HTML_PAGE = """
       <form id="chat-form">
         <textarea
           id="user-input"
-          placeholder="Опиши задачу закупки мерча…"
+          placeholder="Опиши задачу закупки…"
         ></textarea>
         <div class="form-footer">
           <div class="hint">
@@ -402,6 +437,9 @@ HTML_PAGE = """
       </form>
     </div>
   </div>
+
+  <!-- Подключаем Markdown-рендерер -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 
   <script>
     const chat = document.getElementById('chat');
@@ -440,7 +478,16 @@ HTML_PAGE = """
       bubble.appendChild(label);
 
       const body = document.createElement('div');
-      body.textContent = text;
+      body.className = 'bubble-body';
+
+      if (role === 'assistant' && window.marked && typeof window.marked.parse === 'function') {
+        // Рендерим Markdown для ответов агента
+        body.innerHTML = window.marked.parse(text || '');
+      } else {
+        // Для пользователя — просто текст, без HTML
+        body.textContent = text;
+      }
+
       bubble.appendChild(body);
 
       if (role === 'assistant' && plan) {
@@ -462,6 +509,12 @@ HTML_PAGE = """
           const spanItems = document.createElement('span');
           spanItems.textContent = 'Позиций: ' + plan.request.items.length;
           meta.appendChild(spanItems);
+        }
+
+        if (plan._meta && plan._meta.mode) {
+          const spanMode = document.createElement('span');
+          spanMode.textContent = 'Режим: ' + plan._meta.mode;
+          meta.appendChild(spanMode);
         }
 
         bubble.appendChild(meta);
@@ -543,70 +596,6 @@ HTML_PAGE = """
 """
 
 
-# ----------------- Локальное человекочитаемое резюме плана -----------------
-
-
-def summarize_plan_for_user(plan: Dict[str, Any], user_message: str) -> str:
-    """
-    Простое человекочитаемое резюме по JSON-плану.
-    Без дополнительного LLM-вызова.
-    """
-    request = plan.get("request") or {}
-    items = request.get("items") or []
-
-    totals_target = plan.get("totals_target_currency") or {}
-    totals_supplier = plan.get("totals_supplier_currency") or {}
-
-    # Что показывать в итоге — приоритет у целевой валюты
-    display_totals = totals_target or totals_supplier or {}
-    currency = str(display_totals.get("currency") or "")
-    total_net = display_totals.get("total_net")
-    total_items = display_totals.get("total_items")
-
-    supplier_offers = plan.get("supplier_offers")
-    unavailable = []
-    if isinstance(supplier_offers, dict):
-        unavailable = supplier_offers.get("unavailable_skus") or []
-
-    lines: List[str] = []
-    lines.append("Вот черновой план закупки по твоему запросу.")
-
-    if isinstance(total_items, int):
-        lines.append(f"Всего запрошено товаров: {total_items} шт.")
-
-    if isinstance(total_net, (int, float)):
-        lines.append(
-            f"Оценочная стоимость закупки: {float(total_net):.2f} {currency or ''}."
-        )
-
-    if items:
-        lines.append("")
-        lines.append("Позиции в плане:")
-        for it in items:
-            sku = str(it.get("sku") or "позиция без названия")
-            qty = it.get("quantity")
-            max_price = it.get("max_unit_price")
-            if isinstance(qty, int):
-                if isinstance(max_price, (int, float)):
-                    lines.append(
-                        f"- {sku} — {qty} шт., лимит {float(max_price):.2f} за штуку."
-                    )
-                else:
-                    lines.append(f"- {sku} — {qty} шт.")
-            else:
-                lines.append(f"- {sku}")
-
-    if unavailable:
-        lines.append("")
-        lines.append(
-            "Для следующих позиций не удалось подобрать предложения поставщика:"
-        )
-        for sku in unavailable:
-            lines.append(f"- {sku}")
-
-    return "\n".join(lines)
-
-
 # ----------------- Маршруты -----------------
 
 
@@ -622,10 +611,9 @@ async def chat_endpoint(req: ChatRequest) -> ChatResponse:
     Принимает текст пользователя, строит план закупки через MCP-агента
     и возвращает JSON-план + краткое резюме.
 
-    Поддерживает контекст диалога через conversation_id
-    (для отображения истории на фронте).
+    Поддерживает контекст диалога через conversation_id.
     """
-    logger.info("Incoming chat message: %s", req.message)
+    logger.info("Incoming chat message: %s (AGENT_MODE=%s)", req.message, AGENT_MODE)
 
     # 1. Определяем / создаём диалог
     conv_id = req.conversation_id
@@ -635,11 +623,14 @@ async def chat_endpoint(req: ChatRequest) -> ChatResponse:
 
     history = conversations[conv_id]
 
-    # 2. Строим план (сейчас без передачи history в LLM — запрос обрабатывается как самостоятельный)
-    plan = await build_procurement_plan(req.message)
+    # 2. Строим план с учётом истории и режима агента
+    if AGENT_MODE == "tools-agent":
+        plan = await build_procurement_plan_tools_agent(req.message, history=history)
+    else:
+        plan = await build_procurement_plan(req.message, history=history)
 
-    # 3. Краткое резюме на основе JSON-плана
-    summary = summarize_plan_for_user(plan, req.message)
+    # 3. Краткое резюме — тоже с историей
+    summary = await summarize_plan_for_user(plan, req.message, history=history)
 
     # 4. Обновляем историю (добавляем текущий обмен)
     history.append({"role": "user", "content": req.message})
