@@ -4,514 +4,547 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, HttpUrl, ValidationError
-
+from dotenv import load_dotenv, find_dotenv
 from openai import AsyncOpenAI
+from pydantic import BaseModel, Field, HttpUrl
+
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-# -------------------------------------------------------------
-# Логирование и конфиг
-# -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Инициализация окружения и логирования
+# ---------------------------------------------------------------------------
 
-logger = logging.getLogger("procurement_agent")
+load_dotenv(find_dotenv())
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+logger = logging.getLogger("procurement_agent")
 
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Настройки LLM (OpenAI-совместимый endpoint Cloud.ru)
+# ---------------------------------------------------------------------------
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_BASE_URL = os.getenv(
+    "OPENAI_BASE_URL"
+)  # например: https://foundation-models.api.cloud.ru/v1/
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-@dataclass
-class Settings:
-    model: str
-    supplier_mcp_url: str
-    fx_mcp_url: str
-    notification_mcp_url: str
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        return cls(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            supplier_mcp_url=os.getenv("SUPPLIER_MCP_URL", "http://127.0.0.1:8000/mcp"),
-            fx_mcp_url=os.getenv("FX_MCP_URL", "http://127.0.0.1:8001/mcp"),
-            notification_mcp_url=os.getenv(
-                "NOTIFICATION_MCP_URL", "http://127.0.0.1:8002/mcp"
-            ),
-        )
-
-
-settings = Settings.from_env()
-
-# -------------------------------------------------------------
-# Модели домена
-# -------------------------------------------------------------
-
-
-class PurchaseItem(BaseModel):
-    """Позиция закупки, как её должен понять агент."""
-
-    sku: str = Field(..., description="Название или артикул товара")
-    quantity: int = Field(..., gt=0, description="Количество единиц товара")
-    max_unit_price: Optional[float] = Field(
-        default=None,
-        gt=0,
-        description="Максимальная цена за единицу в целевой валюте (опционально)",
-    )
-
-
-class ParsedRequest(BaseModel):
-    """Распарсенный из LLM запрос пользователя."""
-
-    target_currency: str = Field(
-        "RUB",
-        description="Целевая валюта для итогового плана (например, RUB/EUR/USD)",
-    )
-    budget: Optional[float] = Field(
-        default=None,
-        gt=0,
-        description="Общий бюджет в целевой валюте (опционально)",
-    )
-    webhook_url: Optional[HttpUrl] = Field(
-        default=None,
-        description="URL вебхука для отправки готового плана (опционально)",
-    )
-    items: List[PurchaseItem]
-
-
-class Totals(BaseModel):
-    """Агрегированные итоги из supplier-pricing-mcp."""
-
-    currency: str
-    total_net: float
-    total_items: int
-
-
-# -------------------------------------------------------------
-# Вызов MCP-серверов (streamable-http)
-# -------------------------------------------------------------
-
-
-async def _call_mcp_tool(server_url: str, tool_name: str, arguments: Dict[str, Any]) -> Any:
-    """
-    Вызов MCP-тулзы через streamable-http.
-
-    На выходе — уже распакованный Python-объект (dict/list/...),
-    а не сырой CallToolResult.
-    """
-    logger.info("Calling MCP tool %s on %s with args=%s", tool_name, server_url, arguments)
-
-    async with streamablehttp_client(server_url) as (read, write, get_session_id):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            session_id = get_session_id()
-            if session_id is not None:
-                logger.debug("MCP session ID: %s", session_id)
-
-            result = await session.call_tool(tool_name, arguments=arguments)
-            return _unwrap_tool_result(result)
-
-
-def _unwrap_tool_result(result: Any) -> Any:
-    """
-    Аккуратно достаём полезные данные из CallToolResult.
-
-    Приоритет:
-    1) result.structured_content (BulkOffersResult / ConvertAmountResponse / WebhookResult и т.п.)
-    2) JSON-контент в первой части result.content
-       - если type == "json" → part.json
-       - если type == "text" → пытаемся json.loads(part.text) и берём structured_content,
-         если он там есть
-    3) иначе возвращаем как есть.
-    """
-    # 1) structured_content — идеальный вариант
-    structured = getattr(result, "structured_content", None)
-    if structured not in (None, {}, []):
-        return structured
-
-    # 2) content[0]
-    content = getattr(result, "content", None)
-    if content:
-        part = content[0]
-        part_type = getattr(part, "type", None)
-
-        # JSON-контент (для Content type="json")
-        if part_type == "json":
-            # У JSONContent поле .json — это уже Python-объект (dict/list/…)
-            return getattr(part, "json", None)
-
-        # Текстовый контент — часто в нём лежит JSON строкой
-        if part_type == "text":
-            text = getattr(part, "text", "")
-            if isinstance(text, str):
-                try:
-                    parsed = json.loads(text)
-                    # Если это “обёртка” ToolResult — достаем structured_content
-                    if isinstance(parsed, dict) and "structured_content" in parsed:
-                        return parsed["structured_content"]
-                    return parsed
-                except Exception:
-                    # Это просто текст, не JSON — отдадим как есть
-                    return text
-
-    # 3) Fallback — отдаём объект как есть (на крайний случай)
-    return result
-
-
-# -------------------------------------------------------------
-# LLM (OpenAI)
-# -------------------------------------------------------------
+if not OPENAI_API_KEY:
+    logger.warning("OPENAI_API_KEY is not set, LLM-вызовы упадут.")
 
 _llm_client: Optional[AsyncOpenAI] = None
 
 
 def get_llm_client() -> AsyncOpenAI:
-    """
-    Ленивая инициализация клиента OpenAI.
-
-    OPENAI_API_KEY читается из окружения.
-    При необходимости можно задать OPENAI_BASE_URL
-    (например, если используешь OpenAI-совместимый прокси/клауд).
-    """
+    """Ленивая инициализация клиента OpenAI-совместимого API."""
     global _llm_client
     if _llm_client is None:
-        _llm_client = AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL") or None,
-        )
+        kwargs: Dict[str, Any] = {"api_key": OPENAI_API_KEY}
+        if OPENAI_BASE_URL:
+            kwargs["base_url"] = OPENAI_BASE_URL.rstrip("/")
+        _llm_client = AsyncOpenAI(**kwargs)
     return _llm_client
 
 
-async def parse_user_request(
-    raw_text: str,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> ParsedRequest:
-    """
-    LLM → строго типизированный ParsedRequest по JSON-схеме.
+# ---------------------------------------------------------------------------
+# Настройки MCP-серверов
+# ---------------------------------------------------------------------------
 
-    history — список сообщений в формате OpenAI-чата:
-    [{"role": "user"|"assistant", "content": "..."}]
+SUPPLIER_MCP_URL = os.getenv("SUPPLIER_MCP_URL", "http://127.0.0.1:8000/mcp")
+FX_MCP_URL = os.getenv("FX_MCP_URL", "http://127.0.0.1:8001/mcp")
+NOTIFICATION_MCP_URL = os.getenv("NOTIFICATION_MCP_URL", "http://127.0.0.1:8002/mcp")
 
-    Мы используем её, чтобы понимать фразы типа
-    "добавь ещё 3 монитора" на основе предыдущего контекста.
-    """
+# ---------------------------------------------------------------------------
+# Модели данных
+# ---------------------------------------------------------------------------
+
+
+class ParsedItem(BaseModel):
+    """Позиция закупки, как её возвращает LLM-парсер."""
+
+    sku: str = Field(..., description="Текстовый запрос под поиск товара в Printful")
+    quantity: int = Field(..., ge=1)
+    max_unit_price: Optional[float] = Field(
+        None,
+        description="Максимальная цена за штуку (в валюте пользователя), если указана",
+    )
+
+
+class ParsedRequest(BaseModel):
+    """Распарсенный запрос пользователя."""
+
+    target_currency: str = Field(
+        "",
+        description="В какой валюте показать итоги (например, 'EUR', 'USD', 'RUB')",
+    )
+    budget: Optional[float] = Field(
+        None, description="Общий бюджет (если указан пользователем)"
+    )
+    webhook_url: Optional[HttpUrl] = Field(
+        None, description="URL вебхука для отправки плана закупки"
+    )
+    items: List[ParsedItem] = Field(default_factory=list)
+
+
+class Totals(BaseModel):
+    currency: str
+    total_net: float
+    total_items: int
+
+
+# ---------------------------------------------------------------------------
+# Промпт для LLM-парсера
+# ---------------------------------------------------------------------------
+PARSE_REQUEST_SYSTEM_PROMPT = """
+Ты — AI-ассистент по закупке мерча через поставщика Printful.
+
+Твоя задача — по русскому текстовому описанию запроса сформировать
+структурированный JSON следующего вида:
+
+{
+  "target_currency": "EUR",
+  "budget": 3000.0,
+  "webhook_url": "https://example.com/hook",
+  "items": [
+    {
+      "sku": "hoodie",
+      "quantity": 50,
+      "max_unit_price": 50.0
+    }
+  ]
+}
+
+ГЛАВНОЕ ТРЕБОВАНИЕ: поле items[].sku — это КРАТКИЙ ПОИСКОВЫЙ КЛЮЧ
+ДЛЯ КАТАЛОГА PRINTFUL. ОЧЕНЬ ВАЖНО, ЧТОБЫ ОН БЫЛ ПРАВИЛЬНЫМ.
+
+Правила для items[].sku:
+
+1) Используй только базовые английские названия типов товаров:
+   - "hoodie"          — для худи, толстовок, тёплых кофт с капюшоном;
+   - "t-shirt"         — для футболок, лонгсливов;
+   - "mug"             — для кружек, чашек;
+   - "sweatshirt"      — для свитшотов без капюшона;
+   - "tote bag"        — для шопперов, сумок;
+   - "cap"             — для кепок, бейсболок;
+   - "hat"             — для шапок;
+   - "sticker"         — для стикеров, наклеек;
+   - "notebook"        — для блокнотов;
+   - "backpack"        — для рюкзаков;
+   - "phone case"      — для чехлов на телефон;
+   - если ничего не подходит, выбери максимально близкий тип.
+
+2) НЕ используй лишние слова в sku:
+   - НЕЛЬЗЯ: "unisex hoodie", "black hoodie", "conference hoodie", "logo mug".
+   - НУЖНО:  "hoodie", "t-shirt", "mug".
+   - Допускаются только варианты из списка выше (1–2 слова максимум).
+
+3) Перевод с русского на sku:
+   - "худи", "толстовки", "толстовка", "кофты с капюшоном" → "hoodie"
+   - "футболки", "футболка", "лонгсливы" → "t-shirt"
+   - "кружки", "чашки", "кружка", "чашка" → "mug"
+   - "свитшоты", "толстовки без капюшона" → "sweatshirt"
+   - "шопперы", "сумки", "эко-сумки" → "tote bag"
+   - "кепки", "бейсболки" → "cap"
+   - "шапки", "beanie" → "hat"
+   - "стикеры", "наклейки" → "sticker"
+   - "блокноты" → "notebook"
+   - "рюкзаки" → "backpack"
+
+4) Никаких характеристик (цвет, размер, логотип, качество) внутрь sku НЕ добавляй.
+   Вся дополнительная информация учитывается только в текстовом описании
+   запроса пользователя, но НЕ попадает в sku.
+
+Примеры ПРАВИЛЬНОГО формирования items[].sku:
+
+- "хочу худи с логотипом для сотрудников" →
+  sku: "hoodie"
+
+- "нужны футболки и кружки для конференции" →
+  items:
+    { "sku": "t-shirt", "quantity": ... },
+    { "sku": "mug", "quantity": ... }
+
+- "шопперы и кепки с логотипом" →
+  "tote bag" и "cap"
+
+---
+
+Остальные поля:
+
+2) items[].quantity
+   - Целое число штук для каждой позиции.
+
+3) items[].max_unit_price
+   - Если в запросе указана максимальная цена за единицу — укажи её
+     как число (float) в валюте пользователя, которую ты распознал.
+   - Если явно не указано ограничение по цене за штуку — ставь null.
+
+4) budget
+   - Если пользователь указал общий бюджет (например, "до 3000 евро",
+     "бюджет 500 тысяч рублей") — распарсь его в число (float) в той же валюте.
+   - Если общего бюджета нет — ставь null.
+
+5) target_currency
+   - Определи, в какой валюте пользователь хочет видеть итоги:
+     "EUR", "USD", "RUB" и т.п.
+   - Если явно не сказано — выбери наиболее естественную валюту из контекста
+     (например, если в тексте "евро" — EUR, "доллары" — USD, "рублей" — RUB).
+   - Если совсем непонятно — используй "USD".
+
+6) webhook_url
+   - Если пользователь дал URL, куда отправить план закупки — сохрани его
+     как строку.
+   - Если URL нет — ставь null.
+
+Отвечай СТРОГО валидным JSON по этой схеме, без дополнительных полей и комментариев.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Вызов LLM для парсинга пользовательского текста
+# ---------------------------------------------------------------------------
+
+
+async def parse_user_request(user_text: str) -> ParsedRequest:
+    """Преобразовать свободный текст пользователя в структурированный ParsedRequest через LLM."""
     client = get_llm_client()
 
-    system_prompt = (
-        "Ты AI-ассистент отдела закупок. "
-        "Твоя задача — разобрать ТЕКУЩИЙ запрос пользователя с учётом "
-        "всего контекста диалога и выдать обновлённый список позиций закупки.\n\n"
-        "Верни СТРОГО один JSON-объект по такой схеме:\n"
-        "{\n"
-        '  "target_currency": "RUB|EUR|USD|...",\n'
-        '  "budget": число или null,\n'
-        '  "webhook_url": "https://..." или null,\n'
-        '  "items": [\n'
-        "    {\n"
-        '      "sku": "строка",\n'
-        '      "quantity": целое > 0,\n'
-        '      "max_unit_price": число или null\n'
-        "    }\n"
-        "  ]\n"
-        "}\n"
-        "items — это итоговый список после применения всех пожеланий "
-        "из диалога (включая текущий запрос). Никакого текста вне JSON."
-    )
-
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt}
+    messages = [
+        {"role": "system", "content": PARSE_REQUEST_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": f"Текст запроса:\n{user_text}\n\nВерни ТОЛЬКО JSON без комментариев.",
+        },
     ]
 
-    # Добавляем историю диалога (юзер + ассистент)
-    if history:
-        messages.extend(history)
-
-    # Текущий запрос — последним
-    messages.append({"role": "user", "content": raw_text})
-
-    resp = await client.chat.completions.create(
-        model=settings.model,
-        response_format={"type": "json_object"},
-        messages=messages,
-    )
-
-    content = resp.choices[0].message.content
     try:
+        resp = await client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+        content = resp.choices[0].message.content
         data = json.loads(content)
-    except json.JSONDecodeError as e:
-        logger.error("LLM вернул невалидный JSON: %s", content)
-        raise RuntimeError(f"LLM returned invalid JSON: {e}") from e
-
-    try:
         parsed = ParsedRequest.model_validate(data)
-    except ValidationError as e:
-        logger.error("JSON не проходит валидацию ParsedRequest: %s", e)
-        raise
+        logger.info("Parsed user request: %s", parsed.model_dump(mode="json"))
+        return parsed
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка при парсинге запроса через LLM: %s", exc)
+        # Фоллбек: одна позиция, всё по умолчанию
+        fallback = ParsedRequest(
+            target_currency="USD",
+            budget=None,
+            webhook_url=None,
+            items=[
+                ParsedItem(
+                    sku="generic merch item",
+                    quantity=1,
+                    max_unit_price=None,
+                )
+            ],
+        )
+        return fallback
 
-    logger.info("Parsed user request: %s", parsed.model_dump())
-    return parsed
+
+# ---------------------------------------------------------------------------
+# Базовый помощник для вызова MCP-серверов
+# ---------------------------------------------------------------------------
 
 
-# -------------------------------------------------------------
-# Бизнес-логика: сборка плана закупок
-# -------------------------------------------------------------
-
-
-def _aggregate_totals_from_supplier_response(supplier_resp: Dict[str, Any]) -> Totals:
-    """
-    Используем формат BulkOffersResult из supplier-pricing-mcp:
-
-    {
-      "currency": "USD",
-      "items": [
-        {
-          "item": { "sku": "...", "quantity": 10, "max_unit_price": ... },
-          "offers": [ ... ]
-        },
-        ...
-      ],
-      "total_min_cost": 1234.56,
-      "unavailable_skus": [...]
-    }
-    """
-    currency = supplier_resp.get("currency") or "RUB"
-    items = supplier_resp.get("items", [])
-    total_min_cost = float(supplier_resp.get("total_min_cost") or 0.0)
-
-    total_items = 0
-    for item_entry in items:
-        item = item_entry.get("item") or {}
-        qty = item.get("quantity") or 0
-        try:
-            total_items += int(qty)
-        except (TypeError, ValueError):
-            continue
-
-    return Totals(
-        currency=currency,
-        total_net=round(total_min_cost, 2),
-        total_items=total_items,
+async def _call_mcp_tool_json(
+    server_url: str,
+    tool_name: str,
+    arguments: Dict[str, Any] | None,
+) -> Dict[str, Any] | str:
+    """Вспомогательная функция: вызвать MCP-tool и вернуть JSON-ответ или строку-ошибку."""
+    logger.info(
+        "Calling MCP tool %s on %s with args=%r", tool_name, server_url, arguments
     )
+    try:
+        async with streamablehttp_client(server_url) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, arguments or {})
+
+        # result: CallToolResult
+        logger.info("MCP tool %s result: %r", tool_name, result)
+        if getattr(result, "is_error", False):
+            err = getattr(result, "error", None)
+            msg = getattr(err, "message", None) if err else None
+            msg = msg or "unknown MCP error"
+            return f"Error calling tool '{tool_name}': {msg}"
+
+        # 1) Предпочитаем result.data (развёрнутый structured_content)
+        data = getattr(result, "data", None)
+        if data is not None:
+            return data
+
+        # 2) structured_content как dict / список dict-ов
+        struct = getattr(result, "structured_content", None)
+        if struct is not None:
+            if isinstance(struct, list) and struct and isinstance(struct[0], dict):
+                return struct[0]
+            if isinstance(struct, dict):
+                return struct
+
+        # 3) Фоллбек — пробуем распарсить JSON из content[0].text
+        contents = getattr(result, "content", None) or []
+        for c in contents:
+            text = getattr(c, "text", None)
+            if not text:
+                continue
+            try:
+                return json.loads(text)
+            except Exception:
+                # не JSON — вернём как текст
+                return text
+
+        return {}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "Ошибка при вызове MCP tool %s на %s: %s", tool_name, server_url, exc
+        )
+        return f"Error calling tool '{tool_name}': {exc}"
 
 
-async def build_procurement_plan(
-    user_text: str,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> Dict[str, Any]:
-    """
-    Главный e2e-пайплайн:
+# ---------------------------------------------------------------------------
+# Обёртки над конкретными MCP-серверами
+# ---------------------------------------------------------------------------
 
-    1) LLM → ParsedRequest (с учётом истории диалога)
-    2) supplier-pricing-mcp.get_offers_for_items
-    3) fx-rates-mcp.convert_amount (если нужна другая валюта)
-    4) notification-mcp.send_procurement_plan_webhook (если есть webhook_url)
 
-    history — список сообщений в формате OpenAI-чата.
-    """
-    # 1. Парсим запрос пользователя с контекстом
-    parsed = await parse_user_request(user_text, history=history)
-
-    # 2. supplier-pricing-mcp: подбор офферов
-    supplier_args = {
-        "items": [
-            {
-                "sku": item.sku,
-                "quantity": item.quantity,
-                "max_unit_price": item.max_unit_price,
-            }
-            for item in parsed.items
-        ],
+async def call_supplier_mcp(items: List[ParsedItem]) -> Dict[str, Any] | str:
+    """Вызвать supplier-pricing-mcp/get_offers_for_items."""
+    args = {
+        "items": [item.model_dump(mode="json") for item in items],
         "max_suppliers_per_item": 3,
     }
+    resp = await _call_mcp_tool_json(SUPPLIER_MCP_URL, "get_offers_for_items", args)
+    logger.info("supplier-pricing-mcp response: %r", resp)
+    return resp
 
-    supplier_resp = await _call_mcp_tool(
-        settings.supplier_mcp_url,
-        "get_offers_for_items",
-        supplier_args,
+
+async def call_fx_mcp(amount: float, base: str, quote: str) -> Dict[str, Any] | str:
+    """Вызвать fx-rates-mcp/convert_amount."""
+    args = {"amount": amount, "base": base, "quote": quote}
+    resp = await _call_mcp_tool_json(FX_MCP_URL, "convert_amount", args)
+    logger.info("fx-rates-mcp response: %r", resp)
+    return resp
+
+
+async def send_plan_webhook(url: str, plan: Dict[str, Any]) -> Dict[str, Any] | str:
+    """Вызвать notification-mcp/send_procurement_plan_webhook."""
+    args = {"url": url, "plan": plan}
+    resp = await _call_mcp_tool_json(
+        NOTIFICATION_MCP_URL,
+        "send_procurement_plan_webhook",
+        args,
     )
-    logger.info("supplier-pricing-mcp response: %s", supplier_resp)
+    logger.info("notification-mcp response: %r", resp)
+    return resp
 
+
+# ---------------------------------------------------------------------------
+# Агрегация результатов поставщика
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_totals_from_supplier_response(
+    supplier_resp: Dict[str, Any] | str,
+) -> Totals:
+    """
+    Посчитать общую сумму и количество по ответу supplier-pricing-mcp.
+
+    Поддерживает два формата:
+    1) Уже "чистый" словарь от MCP-сервера:
+       {
+         "currency": "...",
+         "items": [...],
+         "total_min_cost": ...
+       }
+
+    2) Обёртка результата mcp.call_tool:
+       {
+         "_meta": ...,
+         "content": [...],
+         "structuredContent": {
+             "currency": "...",
+             "items": [...],
+             "total_min_cost": ...
+         },
+         "isError": false
+       }
+    """
+    # Строка или что-то ещё странное — считаем, что ничего не купили
+    if isinstance(supplier_resp, str):
+        return Totals(currency="USD", total_net=0.0, total_items=0)
+
+    if not isinstance(supplier_resp, dict):
+        return Totals(currency="USD", total_net=0.0, total_items=0)
+
+    # Если это "обёртка" от MCP — разворачиваем до structuredContent
+    if "structuredContent" in supplier_resp and isinstance(
+        supplier_resp["structuredContent"],
+        dict,
+    ):
+        supplier_resp = supplier_resp["structuredContent"]
+    elif "structured_content" in supplier_resp and isinstance(
+        supplier_resp["structured_content"],
+        dict,
+    ):
+        # На будущее, если библиотека вернёт snake_case
+        supplier_resp = supplier_resp["structured_content"]
+
+    # Далее работаем уже с "плоским" объектом вида:
+    # {"currency": "...", "items": [...], "total_min_cost": ...}
+    currency = str(supplier_resp.get("currency") or "USD")
+
+    total_net_raw = supplier_resp.get("total_min_cost", 0.0)
+    try:
+        total_net = float(total_net_raw)
+    except (TypeError, ValueError):
+        total_net = 0.0
+
+    total_items = 0
+    for item_block in supplier_resp.get("items", []) or []:
+        item = item_block.get("item") or {}
+        qty_raw = item.get("quantity", 0)
+        try:
+            qty = int(qty_raw)
+        except (TypeError, ValueError):
+            qty = 0
+        total_items += qty
+
+    return Totals(currency=currency, total_net=total_net, total_items=total_items)
+
+
+
+# ---------------------------------------------------------------------------
+# Построение плана закупки end-to-end
+# ---------------------------------------------------------------------------
+
+
+async def build_procurement_plan(user_text: str) -> Dict[str, Any]:
+    """
+    Главная функция пайплайна:
+
+    user_text → LLM-парсер → supplier-pricing-mcp (Printful) →
+    fx-rates-mcp → notification-mcp → итоговый JSON-план.
+    """
+    # 1) Парсинг запроса
+    parsed_request = await parse_user_request(user_text)
+
+    # 2) Вызов поставщика
+    supplier_resp = await call_supplier_mcp(parsed_request.items)
     totals_supplier = _aggregate_totals_from_supplier_response(supplier_resp)
 
-    # Превращаем Pydantic-модели в JSON-дружественные dict'ы
-    request_data = parsed.model_dump(mode="json")
-    totals_supplier_data = totals_supplier.model_dump(mode="json")
+    # 3) Конвертация валюты (если нужно)
+    fx_raw: Dict[str, Any] | str | None = None
+    totals_target = Totals(
+        currency=parsed_request.target_currency or totals_supplier.currency,
+        total_net=totals_supplier.total_net,
+        total_items=totals_supplier.total_items,
+    )
 
+    if (
+        parsed_request.target_currency
+        and parsed_request.target_currency != totals_supplier.currency
+    ):
+        fx_raw = await call_fx_mcp(
+            amount=totals_supplier.total_net,
+            base=totals_supplier.currency,
+            quote=parsed_request.target_currency,
+        )
+        # Пытаемся аккуратно вытащить amount_quote
+        if isinstance(fx_raw, dict):
+            aq = fx_raw.get("amount_quote")
+            try:
+                converted = float(aq)
+                totals_target = Totals(
+                    currency=parsed_request.target_currency,
+                    total_net=converted,
+                    total_items=totals_supplier.total_items,
+                )
+            except (TypeError, ValueError):
+                # если не получилось — оставляем как есть
+                totals_target = Totals(
+                    currency=parsed_request.target_currency,
+                    total_net=totals_supplier.total_net,
+                    total_items=totals_supplier.total_items,
+                )
+        else:
+            # fx-ошибка (строка) — просто копируем сумму
+            totals_target = Totals(
+                currency=parsed_request.target_currency,
+                total_net=totals_supplier.total_net,
+                total_items=totals_supplier.total_items,
+            )
+
+    # 4) Отправка по вебхуку (если есть)
+    webhook_result: Dict[str, Any] | str | None = None
+
+    webhook_url_str: Optional[str] = None
+    if parsed_request.webhook_url is not None:
+        webhook_url_str = str(parsed_request.webhook_url)
+
+    # Собираем план (без webhook_result, чтобы не сериализовывать HttpUrl)
     plan: Dict[str, Any] = {
-        "request": request_data,
+        "request": parsed_request.model_dump(mode="json"),
         "supplier_offers": supplier_resp,
-        "totals_supplier_currency": totals_supplier_data,
+        "totals_supplier_currency": totals_supplier.model_dump(mode="json"),
+        "totals_target_currency": totals_target.model_dump(mode="json"),
+        "fx_metadata": fx_raw,
     }
 
-    # 3. Если целевая валюта отличается — конвертируем через fx-rates-mcp
-    # Но только если есть что конвертировать (total_net > 0)
-    if (
-        parsed.target_currency.upper() != totals_supplier.currency.upper()
-        and totals_supplier.total_net > 0
-    ):
-        fx_args = {
-            "amount": totals_supplier.total_net,
-            "base": totals_supplier.currency,
-            "quote": parsed.target_currency,
-        }
-
-        fx_resp = await _call_mcp_tool(
-            settings.fx_mcp_url,
-            "convert_amount",
-            fx_args,
-        )
-        logger.info("fx-rates-mcp response: %s", fx_resp)
-
-        if isinstance(fx_resp, dict) and "amount_quote" in fx_resp:
-            converted_total = float(fx_resp.get("amount_quote") or 0.0)
-            plan["totals_target_currency"] = {
-                "currency": fx_resp.get("quote", parsed.target_currency),
-                "total_net": round(converted_total, 2),
-            }
-            plan["fx"] = fx_resp
-        else:
-            # fx-rates-mcp вернул ошибку или неожиданный формат — не падаем,
-            # просто оставляем суммы в валюте поставщика.
-            logger.error(
-                "fx-rates-mcp вернул не dict или без поля amount_quote: %r", fx_resp
-            )
-            plan["totals_target_currency"] = totals_supplier_data
-    else:
-        # либо валюты совпадают, либо сумма 0
-        # если сумма 0 — просто считаем, что в целевой валюте тоже 0
-        if totals_supplier.total_net == 0:
-            plan["totals_target_currency"] = {
-                "currency": parsed.target_currency,
-                "total_net": 0.0,
-            }
-        else:
-            plan["totals_target_currency"] = totals_supplier_data
-
-    # Проверка бюджета (если задан)
-    if parsed.budget is not None:
-        within_budget = (
-            plan["totals_target_currency"]["total_net"] <= parsed.budget
-        )
-        plan["budget"] = {
-            "value": parsed.budget,
-            "currency": parsed.target_currency,
-            "within_budget": within_budget,
-        }
-
-    # 4. notification-mcp: отправляем вебхук, если есть
-    if parsed.webhook_url:
-        notif_args = {
-            "url": str(parsed.webhook_url),
-            "plan": plan,
-        }
-        notification_resp = await _call_mcp_tool(
-            settings.notification_mcp_url,
-            "send_procurement_plan_webhook",
-            notif_args,
-        )
-        logger.info("notification-mcp response: %s", notification_resp)
-        plan["notification"] = notification_resp
+    if webhook_url_str:
+        webhook_result = await send_plan_webhook(webhook_url_str, plan)
+        plan["webhook_result"] = webhook_result
 
     return plan
 
 
-# -------------------------------------------------------------
-# Краткое человеческое резюме через LLM
-# -------------------------------------------------------------
-
-
-async def summarize_plan_for_user(
-    plan: Dict[str, Any],
-    user_text: str,
-    history: Optional[List[Dict[str, str]]] = None,
-) -> str:
-    """
-    Берём JSON-план, исходный текст текущего запроса и историю диалога,
-    просим LLM дать короткое бизнес-резюме.
-    """
-    client = get_llm_client()
-
-    system_prompt = (
-        "Ты ассистент отдела закупок. "
-        "На вход тебе дают историю диалога, текущий запрос пользователя и "
-        "рассчитанный JSON-план закупки.\n"
-        "Сделай краткое, понятное бизнес-резюме:\n"
-        "- перечисли основные позиции и количества;\n"
-        "- укажи общую сумму в целевой валюте и сравни с бюджетом (если есть);\n"
-        "- если план был отправлен на вебхук, упомяни это;\n"
-        "- учитывай, что пользователь мог ссылаться на предыдущие сообщения.\n"
-        "Не выводи сырой JSON, только понятный текст."
-    )
-
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": system_prompt}
-    ]
-
-    if history:
-        messages.extend(history)
-
-    plan_json = json.dumps(plan, ensure_ascii=False, indent=2)
-
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                "Текущий запрос пользователя:\n"
-                f"{user_text}\n\n"
-                "Рассчитанный JSON-план (последняя версия):\n"
-                f"{plan_json}"
-            ),
-        }
-    )
-
-    resp = await client.chat.completions.create(
-        model=settings.model,
-        messages=messages,
-    )
-
-    return resp.choices[0].message.content
-
-
-# -------------------------------------------------------------
-# CLI для ручного запуска
-# -------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CLI-обёртка
+# ---------------------------------------------------------------------------
 
 
 async def _run_cli() -> None:
-    print("=== AI агент закупок (MCP + OpenAI) ===")
+    print("=== AI агент закупок (MCP + OpenAI + Printful) ===")
+    print("Введи запрос, например:")
     print(
-        "Введи запрос, например:\n"
-        "Нужно купить 10 ноутбуков до 80 000 ₽ за штуку и 5 мониторов, "
-        "бюджет 500 000 ₽, покажи итог в EUR и отправь план в мой вебхук https://example.com/hook\n"
+        "Нужно подготовить мерч к конференции: худи, футболки и кружки, "
+        "покажи итог в EUR и отправь план в мой вебхук https://example.com/hook"
     )
+    print("\nВводи текст, пустая строка — конец:\n")
 
-    print("Вводи текст, пустая строка — конец:\n")
     lines: List[str] = []
     while True:
-        line = input()
+        try:
+            line = input()
+        except EOFError:
+            break
         if not line.strip():
             break
         lines.append(line)
-    user_text = "\n".join(lines).strip()
 
+    user_text = "\n".join(lines).strip()
     if not user_text:
         print("Пустой запрос, выходим.")
         return
 
     print("\n>>> Строю план закупки...\n")
+
     plan = await build_procurement_plan(user_text)
 
     print(">>> JSON-план:")
     print(json.dumps(plan, ensure_ascii=False, indent=2))
-
-    print("\n>>> Краткое резюме:")
-    summary = await summarize_plan_for_user(plan, user_text)
-    print(summary)
 
 
 if __name__ == "__main__":

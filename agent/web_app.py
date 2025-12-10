@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from main import build_procurement_plan, summarize_plan_for_user  # type: ignore
+from main import build_procurement_plan  # type: ignore
 
 load_dotenv()
 
@@ -366,7 +366,7 @@ HTML_PAGE = """
     <header>
       <div class="title">
         <span>🤖 Smart Procurement Agent</span>
-        <span class="pill">MCP · Cloud</span>
+        <span class="pill">MCP · Printful</span>
       </div>
       <div class="status">
         <span class="dot"></span>
@@ -376,8 +376,8 @@ HTML_PAGE = """
 
     <main id="chat">
       <div class="system-note">
-        💡 Опиши, что нужно закупить, и, при желании, добавь бюджет и вебхук для отправки плана.
-        Например: «Купи 10 ноутбуков до 80 000 ₽ и 5 мониторов до 25 000 ₽, покажи итог в EUR и отправь план в мой вебхук».
+        💡 Опиши, какой мерч или промо-товары нужно закупить (худи, футболки, кружки и т.п.), можно указать бюджет и вебхук.
+        Например: «Сделай мерч к конференции на 50 человек: худи, футболки и кружки, покажи итог в EUR и отправь план в мой вебхук https://example.com/hook».
       </div>
     </main>
 
@@ -385,7 +385,7 @@ HTML_PAGE = """
       <form id="chat-form">
         <textarea
           id="user-input"
-          placeholder="Опиши задачу закупки…"
+          placeholder="Опиши задачу закупки мерча…"
         ></textarea>
         <div class="form-footer">
           <div class="hint">
@@ -543,6 +543,70 @@ HTML_PAGE = """
 """
 
 
+# ----------------- Локальное человекочитаемое резюме плана -----------------
+
+
+def summarize_plan_for_user(plan: Dict[str, Any], user_message: str) -> str:
+    """
+    Простое человекочитаемое резюме по JSON-плану.
+    Без дополнительного LLM-вызова.
+    """
+    request = plan.get("request") or {}
+    items = request.get("items") or []
+
+    totals_target = plan.get("totals_target_currency") or {}
+    totals_supplier = plan.get("totals_supplier_currency") or {}
+
+    # Что показывать в итоге — приоритет у целевой валюты
+    display_totals = totals_target or totals_supplier or {}
+    currency = str(display_totals.get("currency") or "")
+    total_net = display_totals.get("total_net")
+    total_items = display_totals.get("total_items")
+
+    supplier_offers = plan.get("supplier_offers")
+    unavailable = []
+    if isinstance(supplier_offers, dict):
+        unavailable = supplier_offers.get("unavailable_skus") or []
+
+    lines: List[str] = []
+    lines.append("Вот черновой план закупки по твоему запросу.")
+
+    if isinstance(total_items, int):
+        lines.append(f"Всего запрошено товаров: {total_items} шт.")
+
+    if isinstance(total_net, (int, float)):
+        lines.append(
+            f"Оценочная стоимость закупки: {float(total_net):.2f} {currency or ''}."
+        )
+
+    if items:
+        lines.append("")
+        lines.append("Позиции в плане:")
+        for it in items:
+            sku = str(it.get("sku") or "позиция без названия")
+            qty = it.get("quantity")
+            max_price = it.get("max_unit_price")
+            if isinstance(qty, int):
+                if isinstance(max_price, (int, float)):
+                    lines.append(
+                        f"- {sku} — {qty} шт., лимит {float(max_price):.2f} за штуку."
+                    )
+                else:
+                    lines.append(f"- {sku} — {qty} шт.")
+            else:
+                lines.append(f"- {sku}")
+
+    if unavailable:
+        lines.append("")
+        lines.append(
+            "Для следующих позиций не удалось подобрать предложения поставщика:"
+        )
+        for sku in unavailable:
+            lines.append(f"- {sku}")
+
+    return "\n".join(lines)
+
+
 # ----------------- Маршруты -----------------
 
 
@@ -558,7 +622,8 @@ async def chat_endpoint(req: ChatRequest) -> ChatResponse:
     Принимает текст пользователя, строит план закупки через MCP-агента
     и возвращает JSON-план + краткое резюме.
 
-    Поддерживает контекст диалога через conversation_id.
+    Поддерживает контекст диалога через conversation_id
+    (для отображения истории на фронте).
     """
     logger.info("Incoming chat message: %s", req.message)
 
@@ -570,11 +635,11 @@ async def chat_endpoint(req: ChatRequest) -> ChatResponse:
 
     history = conversations[conv_id]
 
-    # 2. Строим план с учётом истории
-    plan = await build_procurement_plan(req.message, history=history)
+    # 2. Строим план (сейчас без передачи history в LLM — запрос обрабатывается как самостоятельный)
+    plan = await build_procurement_plan(req.message)
 
-    # 3. Краткое резюме — тоже с историей
-    summary = await summarize_plan_for_user(plan, req.message, history=history)
+    # 3. Краткое резюме на основе JSON-плана
+    summary = summarize_plan_for_user(plan, req.message)
 
     # 4. Обновляем историю (добавляем текущий обмен)
     history.append({"role": "user", "content": req.message})
