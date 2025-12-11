@@ -1,302 +1,568 @@
+"""Инструмент get_offers_for_items для supplier-pricing-mcp.
+
+Каскад режимов работы:
+
+1) REAL (Printful) — если:
+   - USE_PRINTFUL=true (по умолчанию),
+   - задан PRINTFUL_API_KEY,
+   - и Printful API отвечает.
+
+2) FAKESTORE FALLBACK — если:
+   - Printful отключён флагом,
+   - или нет PRINTFUL_API_KEY,
+   - или Printful упал/недоступен по сети.
+   В этом режиме используем публичный fakestoreapi.com как "поставщика".
+
+3) DEMO FALLBACK — если:
+   - даже fakestoreapi.com недоступен.
+   Возвращаем структуру с нулевой стоимостью, но корректного формата,
+   чтобы агент и UI не падали.
+
+Переменные окружения:
+
+- PRINTFUL_API_KEY   — ключ Printful (если нет, сразу идём в fakestore).
+- PRINTFUL_API_BASE  — базовый URL Printful (по умолчанию https://api.printful.com).
+- USE_PRINTFUL       — "true"/"false", чтобы принудительно отключить Printful.
+- SUPPLIER_CURRENCY  — валюта поставщика (по умолчанию USD).
+"""
+
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+import os
+from typing import Any, Dict, List, Tuple
 
-from mcp.types import CallToolResult, TextContent
-from pydantic import BaseModel, Field
+import httpx
 
 from mcp_instance import mcp
-from .printful_client import get_printful_client, PrintfulApiError
 
 logger = logging.getLogger(__name__)
 
+PRINTFUL_API_KEY = os.getenv("PRINTFUL_API_KEY")
+PRINTFUL_API_BASE = os.getenv("PRINTFUL_API_BASE", "https://api.printful.com")
+USE_PRINTFUL = os.getenv("USE_PRINTFUL", "true").lower() in ("1", "true", "yes", "y")
+DEFAULT_CURRENCY = os.getenv("SUPPLIER_CURRENCY", "USD")
 
-class ItemRequest(BaseModel):
-    """Описание позиции из агента закупок.
 
-    ВАЖНО: теперь sku трактуем как ТЕКСТОВЫЙ ЗАПРОС в каталог Printful.
-    Примеры:
-      - "unisex hoodie black L"
-      - "black hoodie L"
-      - "premium t-shirt white M"
+# ======================================================================
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ======================================================================
+
+
+def _normalize_sku_to_query(sku: str) -> str:
+    """Простейшее сопоставление внутреннего sku → текстовый запрос в каталог Printful."""
+    raw = (sku or "").strip()
+    normalized = raw.lower()
+
+    aliases = {
+        "unisex hoodie": "hoodie",
+        "hoodie": "hoodie",
+        "hoodie_unisex": "hoodie",
+        "sweatshirt": "hoodie",
+        "hoodie sweatshirt": "hoodie",
+
+        "unisex t-shirt": "t-shirt",
+        "t-shirt": "t-shirt",
+        "tshirt": "t-shirt",
+        "tee": "t-shirt",
+        "tee shirt": "t-shirt",
+
+        "mug": "mug",
+        "coffee mug": "mug",
+        "cup": "mug",
+    }
+
+    for key, query in aliases.items():
+        if key in normalized:
+            return query
+
+    # По умолчанию ищем как есть
+    return raw or "product"
+
+
+async def _fetch_printful_product_and_variants(
+    client: httpx.AsyncClient,
+    query: str,
+) -> Tuple[Dict[str, Any] | None, List[Dict[str, Any]]]:
+    """Поиск товара в Printful по текстовому запросу + получение вариантов.
+
+    Возвращает:
+      (product_dict | None, [variants...])
     """
+    headers = {"Authorization": f"Bearer {PRINTFUL_API_KEY}"}
 
-    sku: str = Field(..., description="Текстовый запрос/идентификатор позиции")
-    quantity: int = Field(..., ge=1, description="Запрошенное количество")
-    max_unit_price: Optional[float] = Field(
-        None, description="Максимальная цена за штуку в валюте поставщика (если есть лимит)"
+    # 1) Ищем товары по запросу
+    resp = await client.get(
+        f"{PRINTFUL_API_BASE}/catalog/products",
+        params={"search": query, "limit": 1},
+        headers=headers,
+        timeout=15.0,
     )
-
-
-class SupplierOffer(BaseModel):
-    """Оффер одного поставщика по позиции."""
-
-    supplier: str = Field(..., description="Идентификатор поставщика, например 'printful'")
-    sku: str
-    unit_price: float
-    currency: str
-    quantity_available: Optional[int] = Field(
-        None, description="Доступное количество (если известно)"
-    )
-    variant_id: Optional[int] = Field(
-        None, description="Printful catalog variant ID"
-    )
-    description: Optional[str] = Field(
-        None, description="Человекочитаемое описание варианта из каталога Printful"
-    )
-
-
-class ItemOffers(BaseModel):
-    """Офферы по конкретной позиции запроса."""
-
-    item: ItemRequest
-    offers: List[SupplierOffer]
-
-
-class BulkOffersResult(BaseModel):
-    """Агрегированный результат по всем запрошенным позициям."""
-
-    currency: str
-    items: List[ItemOffers]
-    total_min_cost: float
-    unavailable_skus: List[str]
-    resolved_variants: Dict[str, int] = Field(
-        default_factory=dict,
-        description="Динамически подобранный маппинг sku -> Printful catalog_variant_id",
-    )
-
-
-async def _resolve_variant_for_item(
-    client,
-    item: ItemRequest,
-    max_products_to_scan: int = 30,
-    max_variants_per_product: int = 10,
-) -> Optional[Tuple[int, str]]:
-    """
-    Подбираем подходящий Printful variant_id для позиции item.
-
-    Алгоритм (упрощённый):
-      1. Берём item.sku как текст поиска (query).
-      2. Ищем продукты по имени.
-      3. Берём первый подходящий product.
-      4. Берём первые несколько variants этого продукта.
-      5. Выбираем первый variant, возвращаем (variant_id, variant_name).
-
-    Если ничего не нашли — возвращаем None.
-    """
-    query = item.sku.replace("_", " ")
-    logger.info("Resolving Printful variant for sku=%r via query=%r", item.sku, query)
-
-    try:
-        products = await client.search_products_by_name(
-            query=query,
-            limit_products=3,
-            scan_limit=max_products_to_scan,
-        )
-    except PrintfulApiError as exc:
-        logger.error("Printful search_products_by_name error for sku=%s: %s", item.sku, exc)
-        return None
-
+    resp.raise_for_status()
+    payload = resp.json()
+    products = payload.get("result") or []
     if not products:
-        logger.info("No products found in Printful catalog for query=%r", query)
-        return None
+        return None, []
 
-    # Простая стратегия: берём первый продукт, потом первый вариант.
-    for product in products:
-        product_id = product.get("id")
-        if not isinstance(product_id, int):
-            continue
+    product = products[0]
+    product_id = product.get("id")
 
-        try:
-            variants = await client.list_variants_for_product(
-                product_id=product_id,
-                limit_variants=max_variants_per_product,
-            )
-        except PrintfulApiError as exc:
-            logger.error(
-                "Printful list_variants_for_product error for product_id=%s: %s",
-                product_id,
-                exc,
-            )
-            continue
-
-        if not variants:
-            continue
-
-        v = variants[0]
-        variant_id = v.get("id")
-        if not isinstance(variant_id, int):
-            continue
-        variant_name = v.get("name") or ""
-        logger.info(
-            "Resolved sku=%r -> variant_id=%s (%s)", item.sku, variant_id, variant_name
-        )
-        return variant_id, variant_name
-
-    logger.info("Unable to resolve variant for sku=%r via query=%r", item.sku, query)
-    return None
-
-
-def _format_offers_human_readable(result: BulkOffersResult) -> str:
-    lines: List[str] = []
-    lines.append("Результаты подбора офферов (Printful):\n")
-
-    if not result.items:
-        lines.append("Нет позиций в запросе.")
-        return "\n".join(lines)
-
-    for item_offers in result.items:
-        item = item_offers.item
-        lines.append(
-            f"- {item.sku} — запрошено {item.quantity} шт., "
-            f"офферов: {len(item_offers.offers)}"
-        )
-        for offer in item_offers.offers:
-            total = offer.unit_price * item.quantity
-            lines.append(
-                f"  • {offer.supplier}: {offer.unit_price:.2f} {offer.currency} за штуку, "
-                f"~{total:.2f} {offer.currency} за позицию "
-                f"(variant_id={offer.variant_id}, desc={offer.description})"
-            )
-
-    lines.append(
-        f"\nМинимальная суммарная стоимость по всем позициям: "
-        f"{result.total_min_cost:.2f} {result.currency}"
+    # 2) Подтягиваем подробности + варианты
+    resp2 = await client.get(
+        f"{PRINTFUL_API_BASE}/catalog/products/{product_id}",
+        headers=headers,
+        timeout=15.0,
     )
+    resp2.raise_for_status()
+    payload2 = resp2.json()
+    result = payload2.get("result") or {}
+    variants = result.get("variants") or []
 
-    if result.unavailable_skus:
-        lines.append("\nПозиции без офферов:")
-        for sku in result.unavailable_skus:
+    return product, variants
+
+
+def _build_demo_structured(
+    items: List[Dict[str, Any]],
+    reason: str,
+) -> Dict[str, Any]:
+    """Построить структуру ответа в финальном демо-режиме (без реального поставщика)."""
+    item_blocks: List[Dict[str, Any]] = []
+    unavailable_skus: List[str] = []
+
+    for item in items:
+        sku = str((item or {}).get("sku") or "").strip()
+        if sku:
+            unavailable_skus.append(sku)
+        item_blocks.append(
+            {
+                "item": item,
+                "offers": [],
+            }
+        )
+
+    structured = {
+        "currency": DEFAULT_CURRENCY,
+        "items": item_blocks,
+        "total_min_cost": 0.0,
+        "unavailable_skus": unavailable_skus,
+        "resolved_variants": {},
+        "provider": "demo_fallback",
+        "fallback_used": True,
+        "reason": reason,
+    }
+    return structured
+
+
+def _format_summary_text(structured: Dict[str, Any], reason_prefix: str | None = None) -> str:
+    """Сформировать человекочитаемый текстовый отчёт по результатам/фоллбеку."""
+    provider = structured.get("provider") or "unknown"
+    fallback_used = bool(structured.get("fallback_used", False))
+
+    if provider == "printful" and not fallback_used:
+        title = "Результаты подбора офферов (Printful)"
+    elif provider == "fakestoreapi":
+        title = "Результаты подбора офферов (FakeStore API)"
+    else:
+        title = "Результаты подбора офферов (демо-поставщик)"
+
+    lines: List[str] = [title, ""]
+
+    if reason_prefix:
+        lines.append(reason_prefix)
+    if structured.get("reason"):
+        lines.append(f"Причина: {structured['reason']}")
+    if reason_prefix or structured.get("reason"):
+        lines.append("")
+
+    # Перебираем позиции
+    for block in structured.get("items", []) or []:
+        item = block.get("item") or {}
+        sku = item.get("sku")
+        qty = item.get("quantity")
+        try:
+            qty_int = int(qty or 0)
+        except (TypeError, ValueError):
+            qty_int = 0
+
+        offers = block.get("offers") or []
+        lines.append(f"- {sku} — запрошено {qty_int} шт., офферов: {len(offers)}")
+
+        for offer in offers:
+            supplier = offer.get("supplier") or provider
+            unit_raw = offer.get("unit_price", 0.0)
+            try:
+                unit_price = float(unit_raw or 0.0)
+            except (TypeError, ValueError):
+                unit_price = 0.0
+            curr = offer.get("currency") or structured.get("currency") or "USD"
+            variant_id = offer.get("variant_id")
+            desc = offer.get("description") or ""
+            position_total = unit_price * qty_int
+            lines.append(
+                f"  • {supplier}: {unit_price:.2f} {curr} за штуку, "
+                f"~{position_total:.2f} {curr} за позицию "
+                f"(variant_id={variant_id}, desc={desc})"
+            )
+
+    # Итого
+    lines.append("")
+    total_raw = structured.get("total_min_cost", 0.0)
+    try:
+        total = float(total_raw or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    curr = structured.get("currency") or "USD"
+    lines.append(f"Минимальная суммарная стоимость по всем позициям: {total:.2f} {curr}")
+
+    # Позиции без офферов
+    unavailable = structured.get("unavailable_skus") or []
+    if unavailable:
+        lines.append("")
+        lines.append("Позиции без офферов:")
+        for sku in unavailable:
             lines.append(f"- {sku}")
 
-    if result.resolved_variants:
-        lines.append("\nСоответствие sku → Printful variant_id:")
-        for sku, vid in result.resolved_variants.items():
+    # Соответствие sku → variant_id
+    resolved_variants = structured.get("resolved_variants") or {}
+    if resolved_variants:
+        lines.append("")
+        lines.append("Соответствие sku → variant_id:")
+        for sku, vid in resolved_variants.items():
             lines.append(f"- {sku} -> {vid}")
 
     return "\n".join(lines)
 
 
-@mcp.tool(description="Получить офферы поставщика Printful для списка SKU (динамический поиск)")
-async def get_offers_for_items(
-    items: List[ItemRequest],
-    max_suppliers_per_item: int = 3,  # сейчас есть только Printful
-) -> CallToolResult:
-    """
-    Тул для агента закупок:
-    - трактует item.sku как текстовый запрос в каталог Printful;
-    - на лету ищет подходящий catalog_variant_id;
-    - запрашивает цену;
-    - фильтрует по max_unit_price;
-    - возвращает агрегированный BulkOffersResult + resolved_variants.
-    """
-    logger.info(
-        "get_offers_for_items called with %d items, max_suppliers_per_item=%d",
-        len(items),
-        max_suppliers_per_item,
-    )
+def _wrap_tool_result(structured: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Обёртка в формат, с которым уже работает агент.
 
-    try:
-        client = get_printful_client()
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Printful client not configured: %s", exc)
-        unavailable = [item.sku for item in items]
-        result = BulkOffersResult(
-            currency="USD",
-            items=[ItemOffers(item=item, offers=[]) for item in items],
-            total_min_cost=0.0,
-            unavailable_skus=unavailable,
-            resolved_variants={},
-        )
-        text = (
-            "Printful API не сконфигурирован (нет PRINTFUL_API_KEY). "
-            "Все позиции помечены как недоступные.\n\n"
-            + _format_offers_human_readable(result)
-        )
-        return CallToolResult(
-            content=[TextContent(type="text", text=text)],
-            structuredContent=result.model_dump(),
-        )
+    Возвращаем envelope:
+    { "_meta": ..., "content": [...], "structuredContent": {...}, "isError": False }
+    """
+    return {
+        "_meta": None,
+        "content": [
+            {
+                "type": "text",
+                "text": text,
+            }
+        ],
+        "structuredContent": structured,
+        "isError": False,
+    }
 
-    offers_by_item: List[ItemOffers] = []
-    total_cost = 0.0
+
+# ======================================================================
+# PRINTFUL: основной провайдер
+# ======================================================================
+
+
+async def _get_offers_from_printful(
+    items: List[Dict[str, Any]],
+    max_suppliers_per_item: int = 3,
+) -> Dict[str, Any]:
+    """Реальный режим: ходим в Printful API и подбираем варианты под каждую позицию."""
+    if not PRINTFUL_API_KEY:
+        raise RuntimeError("PRINTFUL_API_KEY не задан")
+
+    item_blocks: List[Dict[str, Any]] = []
     unavailable_skus: List[str] = []
     resolved_variants: Dict[str, int] = {}
+    total_min_cost: float = 0.0
+
+    async with httpx.AsyncClient() as client:
+        for item in items:
+            sku = str((item or {}).get("sku") or "").strip()
+            qty_raw = (item or {}).get("quantity", 0)
+            try:
+                qty = int(qty_raw or 0)
+            except (TypeError, ValueError):
+                qty = 0
+
+            max_price_raw = (item or {}).get("max_unit_price", None)
+            try:
+                max_price = float(max_price_raw) if max_price_raw is not None else None
+            except (TypeError, ValueError):
+                max_price = None
+
+            if not sku or qty <= 0:
+                unavailable_skus.append(sku or "<empty>")
+                item_blocks.append({"item": item, "offers": []})
+                continue
+
+            query = _normalize_sku_to_query(sku)
+            try:
+                product, variants = await _fetch_printful_product_and_variants(
+                    client, query=query
+                )
+            except httpx.HTTPError as e:
+                logger.warning(
+                    "Ошибка HTTP при обращении к Printful для sku=%s, query=%s: %s",
+                    sku,
+                    query,
+                    e,
+                )
+                unavailable_skus.append(sku)
+                item_blocks.append({"item": item, "offers": []})
+                continue
+
+            if not product or not variants:
+                unavailable_skus.append(sku)
+                item_blocks.append({"item": item, "offers": []})
+                continue
+
+            variant = variants[0]
+            variant_id = variant.get("id")
+            variant_name = variant.get("name") or ""
+            resolved_variants[sku] = variant_id
+
+            unit_price_raw = variant.get("price")
+            try:
+                unit_price = float(unit_price_raw or 0.0)
+            except (TypeError, ValueError):
+                unit_price = 0.99  # демо-стоимость
+
+            if max_price is not None and unit_price > max_price:
+                unavailable_skus.append(sku)
+                item_blocks.append({"item": item, "offers": []})
+                continue
+
+            position_total = unit_price * qty
+            total_min_cost += position_total
+
+            offer = {
+                "supplier": "printful",
+                "sku": sku,
+                "unit_price": unit_price,
+                "currency": DEFAULT_CURRENCY,
+                "quantity_available": None,
+                "variant_id": variant_id,
+                "description": variant_name,
+            }
+
+            item_blocks.append(
+                {
+                    "item": item,
+                    "offers": [offer][:max_suppliers_per_item],
+                }
+            )
+
+    structured = {
+        "currency": DEFAULT_CURRENCY,
+        "items": item_blocks,
+        "total_min_cost": round(total_min_cost, 2),
+        "unavailable_skus": unavailable_skus,
+        "resolved_variants": resolved_variants,
+        "provider": "printful",
+        "fallback_used": False,
+        "reason": None,
+    }
+    return structured
+
+
+# ======================================================================
+# FAKESTOREAPI: fallback-провайдер
+# ======================================================================
+
+
+def _pick_best_fakestore_product(
+    products: List[Dict[str, Any]],
+    sku_query: str,
+) -> Dict[str, Any] | None:
+    """Простейший скоринг fakestore-продуктов под текстовый sku."""
+    if not products:
+        return None
+
+    query = (sku_query or "").strip().lower()
+    if not query:
+        # Если запрос пустой — просто берём первый продукт
+        return products[0]
+
+    best = None
+    best_score = 0.0
+
+    for p in products:
+        title = str(p.get("title") or "").lower()
+        category = str(p.get("category") or "").lower()
+
+        score = 0.0
+        if query in title:
+            score += 3.0
+        if query in category:
+            score += 2.0
+
+        for word in query.split():
+            if word and word in title:
+                score += 1.0
+            if word and word in category:
+                score += 0.5
+
+        if score > best_score:
+            best_score = score
+            best = p
+
+    if best is None:
+        # Если ничего не подошло — берём первый, чтобы хоть что-то вернуть
+        return products[0]
+
+    return best
+
+
+async def _get_offers_from_fakestore(
+    items: List[Dict[str, Any]],
+    max_suppliers_per_item: int = 3,
+    reason_from_printful: str | None = None,
+) -> Dict[str, Any]:
+    """Fallback-режим: используем fakestoreapi.com как поставщика."""
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://fakestoreapi.com/products",
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        products = resp.json()
+        if not isinstance(products, list):
+            raise RuntimeError("Неверный формат ответа fakestoreapi.com (ожидался список).")
+
+    item_blocks: List[Dict[str, Any]] = []
+    unavailable_skus: List[str] = []
+    resolved_variants: Dict[str, int] = {}
+    total_min_cost: float = 0.0
 
     for item in items:
-        # 1. Разрешаем sku -> variant_id через поиск по каталогу
-        resolved = await _resolve_variant_for_item(client, item)
-        if not resolved:
-            offers_by_item.append(ItemOffers(item=item, offers=[]))
-            unavailable_skus.append(item.sku)
-            continue
-
-        variant_id, variant_name = resolved
-        resolved_variants[item.sku] = variant_id
-
-        # 2. Получаем цену варианта
+        sku = str((item or {}).get("sku") or "").strip()
+        qty_raw = (item or {}).get("quantity", 0)
         try:
-            unit_price, currency = await client.get_variant_price(variant_id)
-        except PrintfulApiError as exc:
-            logger.error(
-                "Failed to fetch price for sku=%s, variant_id=%s: %s",
-                item.sku,
-                variant_id,
-                exc,
-            )
-            offers_by_item.append(ItemOffers(item=item, offers=[]))
-            unavailable_skus.append(item.sku)
+            qty = int(qty_raw or 0)
+        except (TypeError, ValueError):
+            qty = 0
+
+        max_price_raw = (item or {}).get("max_unit_price", None)
+        try:
+            max_price = float(max_price_raw) if max_price_raw is not None else None
+        except (TypeError, ValueError):
+            max_price = None
+
+        if not sku or qty <= 0:
+            unavailable_skus.append(sku or "<empty>")
+            item_blocks.append({"item": item, "offers": []})
             continue
 
-        # 3. Фильтрация по max_unit_price
-        if item.max_unit_price is not None and unit_price > item.max_unit_price:
-            logger.info(
-                "Price %.2f %s for sku=%s exceeds max_unit_price=%.2f; skipping offer",
-                unit_price,
-                currency,
-                item.sku,
-                item.max_unit_price,
-            )
-            offers_by_item.append(ItemOffers(item=item, offers=[]))
-            unavailable_skus.append(item.sku)
+        product = _pick_best_fakestore_product(products, sku)
+        if not product:
+            unavailable_skus.append(sku)
+            item_blocks.append({"item": item, "offers": []})
             continue
 
-        offer = SupplierOffer(
-            supplier="printful",
-            sku=item.sku,
-            unit_price=unit_price,
-            currency=currency,
-            quantity_available=None,
-            variant_id=variant_id,
-            description=variant_name,
+        product_id = product.get("id")
+        title = product.get("title") or ""
+        price_raw = product.get("price", 0.0)
+        try:
+            unit_price = float(price_raw or 0.0)
+        except (TypeError, ValueError):
+            unit_price = 0.0
+
+        if max_price is not None and unit_price > max_price:
+            unavailable_skus.append(sku)
+            item_blocks.append({"item": item, "offers": []})
+            continue
+
+        position_total = unit_price * qty
+        total_min_cost += position_total
+        resolved_variants[sku] = int(product_id) if product_id is not None else -1
+
+        offer = {
+            "supplier": "fakestoreapi",
+            "sku": sku,
+            "unit_price": unit_price,
+            "currency": DEFAULT_CURRENCY,  # fakestoreapi не отдаёт валюту, считаем USD
+            "quantity_available": None,
+            "variant_id": product_id,
+            "description": title,
+        }
+
+        item_blocks.append(
+            {
+                "item": item,
+                "offers": [offer][:max_suppliers_per_item],
+            }
         )
 
-        offers_by_item.append(ItemOffers(item=item, offers=[offer]))
-        total_cost += unit_price * item.quantity
+    reason = reason_from_printful or "Printful отключен или недоступен, используется fakestoreapi.com."
+    structured = {
+        "currency": DEFAULT_CURRENCY,
+        "items": item_blocks,
+        "total_min_cost": round(total_min_cost, 2),
+        "unavailable_skus": unavailable_skus,
+        "resolved_variants": resolved_variants,
+        "provider": "fakestoreapi",
+        "fallback_used": True,
+        "reason": reason,
+    }
+    return structured
 
-    # Валюта — из первого оффера, если есть
-    currency = "USD"
-    for io in offers_by_item:
-        if io.offers:
-            currency = io.offers[0].currency
-            break
 
-    result = BulkOffersResult(
-        currency=currency,
-        items=offers_by_item,
-        total_min_cost=total_cost,
-        unavailable_skus=unavailable_skus,
-        resolved_variants=resolved_variants,
+# ======================================================================
+# MCP TOOL
+# ======================================================================
+
+
+@mcp.tool()
+async def get_offers_for_items(
+    items: List[Dict[str, Any]],
+    max_suppliers_per_item: int = 3,
+) -> Dict[str, Any]:
+    """Подбор предложений поставщика по списку позиций.
+
+    Алгоритм:
+      1. Если USE_PRINTFUL=true и есть PRINTFUL_API_KEY — пробуем Printful.
+      2. Если Printful отключён/не сконфигурирован/упал — пробуем fakestoreapi.com.
+      3. Если и fakestoreapi.com недоступен — отдаём демо-структуру с нулевой стоимостью.
+    """
+    printful_reason: str | None = None
+
+    # 1. Пытаемся использовать Printful (если разрешено и сконфигурировано)
+    if USE_PRINTFUL and PRINTFUL_API_KEY:
+        try:
+            structured = await _get_offers_from_printful(
+                items, max_suppliers_per_item=max_suppliers_per_item
+            )
+            text = _format_summary_text(structured)
+            return _wrap_tool_result(structured, text)
+        except Exception as e:
+            printful_reason = f"Printful API недоступно или вернуло ошибку: {e!r}"
+            logger.exception("get_offers_for_items: %s", printful_reason)
+    else:
+        if not USE_PRINTFUL:
+            printful_reason = "USE_PRINTFUL=false (Printful отключен через конфигурацию)."
+            logger.warning("get_offers_for_items: %s", printful_reason)
+        elif not PRINTFUL_API_KEY:
+            printful_reason = "PRINTFUL_API_KEY не задан, обращение к Printful невозможно."
+            logger.error("get_offers_for_items: %s", printful_reason)
+
+    # 2. Пытаемся использовать fakestoreapi.com как fallback-поставщика
+    try:
+        structured = await _get_offers_from_fakestore(
+            items,
+            max_suppliers_per_item=max_suppliers_per_item,
+            reason_from_printful=printful_reason,
+        )
+        text = _format_summary_text(structured)
+        return _wrap_tool_result(structured, text)
+    except Exception as e2:
+        fakestore_reason = f"FakeStore API недоступно или вернуло ошибку: {e2!r}"
+        logger.exception("get_offers_for_items (fakestore fallback): %s", fakestore_reason)
+
+    # 3. Финальный демо-режим, если реально не достучались ни до Printful, ни до fakestoreapi
+    combined_reason_parts = []
+    if printful_reason:
+        combined_reason_parts.append(printful_reason)
+    combined_reason_parts.append("fakestoreapi.com недоступен или вернул ошибку.")
+    reason = " ; ".join(combined_reason_parts)
+
+    structured = _build_demo_structured(items, reason=reason)
+    text = _format_summary_text(
+        structured,
+        reason_prefix="Работаем в финальном демо-режиме: реальный поставщик недоступен.",
     )
-
-    text_summary = _format_offers_human_readable(result)
-
-    logger.info(
-        "Returning BulkOffersResult: total_min_cost=%.2f %s", total_cost, currency
-    )
-
-    return CallToolResult(
-        content=[TextContent(type="text", text=text_summary)],
-        structuredContent=result.model_dump(),
-    )
+    return _wrap_tool_result(structured, text)
