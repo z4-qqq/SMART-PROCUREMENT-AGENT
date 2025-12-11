@@ -1,8 +1,8 @@
-"""MCP сервер supplier-pricing-mcp.
+"""MCP сервер supplier-pricing-mcp (Printful).
 
 Предоставляет инструменты для:
-- поиска товаров в публичном каталоге;
-- подбора предложений поставщика по списку позиций.
+- подбора предложений поставщика Printful по списку позиций;
+- поиска товаров и вариантов в каталоге Printful.
 """
 
 import os
@@ -33,21 +33,21 @@ def init_tracing() -> None:
 
 init_tracing()
 
-# Регистрируем инструменты (важно: импорт должен быть после init_tracing)
-from tools.search_products import search_products  # noqa: E402,F401
+# Регистрируем инструменты (важно: импорт после init_tracing)
 from tools.get_offers_for_items import get_offers_for_items  # noqa: E402,F401
+from tools.search_printful_catalog import search_printful_catalog  # noqa: E402,F401
 
 
 @mcp.prompt()
 def example_prompt(query: str = "") -> str:
     """Пример MCP-промпта (опционально)."""
-    return f"Сформируй план закупок по запросу: {query}"
+    return f"Сформируй план закупок по мерчу Printful по запросу: {query}"
 
 
 def main() -> None:
     """Запуск MCP-сервера с HTTP-транспортом."""
     print("=" * 60)
-    print("🌐 ЗАПУСК MCP СЕРВЕРА supplier-pricing-mcp")
+    print("🌐 ЗАПУСК MCP СЕРВЕРА supplier-pricing-mcp (Printful)")
     print("=" * 60)
     print(f"🚀 MCP Server: http://{HOST}:{PORT}/mcp")
     print("=" * 60)
