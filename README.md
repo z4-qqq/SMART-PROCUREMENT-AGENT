@@ -1,324 +1,365 @@
-# Smart Procurement Agent (MCP)
+# Smart Procurement Agent (MCP + OpenAI)
 
-AI-агент для автоматизации закупок, построенный на **MCP-серверах** и LLM (OpenAI-совместимый endpoint, в т.ч. Cloud.ru Foundation Models).
+AI-агент закупок, который:
 
-Агент умеет:
+- понимает текстовые запросы вроде  
+  _«Сделай мерч к конференции на 50 человек: худи, футболки и кружки, покажи итог в EUR и отправь план в вебхук…»_;
+- строит план закупки и сам ходит в внешние сервисы через **MCP-серверы**:
+  - `supplier-pricing-mcp` — поставщик (Printful / fakestoreapi.com);
+  - `fx-rates-mcp` — конвертация валют;
+  - `notification-mcp` — отправка плана по вебхуку;
+- отдаёт **JSON-план закупки** и человекочитаемое резюме;
+- имеет простую **web-оболочку** (чат в браузере).
 
-- разобрать текстовый запрос на закупку (позиции, количества, бюджеты, валюту, вебхук);
-- подобрать офферы от поставщиков через отдельный MCP-сервер;
-- при необходимости пересчитать итог в нужную валюту;
-- сформировать JSON-план закупки;
-- по желанию отправить итоговый план на внешний вебхук;
-- показать весь процесс в виде LLM-чата в веб-интерфейсе.
+Проект сделан как демонстрация **бизнес-ориентированного AI-агента**, интегрированного с публичным API через MCP.
 
 ---
 
 ## Архитектура
 
-Репозиторий состоит из четырёх сервисов:
+Репозиторий логически делится на несколько компонент:
 
-```text
-SMART-PROCUREMENT-AGENT/
-├── agent/               # LLM-агент + web UI (FastAPI)
-├── supplier-pricing-mcp/ # MCP-сервер: поиск офферов поставщиков
-├── fx-rates-mcp/         # MCP-сервер: курсы валют и конвертация
-└── notification-mcp/     # MCP-сервер: отправка плана закупок на вебхук
-```
+- `agent/`  
+  LLM-агент закупок:
+  - `main.py` — логика агента (парсинг запроса, работа с MCP, режимы planner/tools-agent);
+  - `web_app.py` — FastAPI + HTML-чат;
+  - `.env` — ключи OpenAI и настройки агента.
 
-### Поток end-to-end
+- `supplier-pricing-mcp/`  
+  MCP-сервер поставщика:
+  - `server.py` — HTTP MCP-сервер;
+  - `tools/get_offers_for_items.py` — подбор офферов поставщика;
+  - интеграция:
+    - **Printful API** (если доступен из региона и задан `PRINTFUL_API_KEY`);
+    - **fakestoreapi.com** как fallback-поставщик;
+    - финальный demo-fallback, если всё внешнее недоступно.
 
-1. Пользователь пишет запрос в веб-чате (или в CLI агента).
-2. `agent` вызывает LLM, чтобы распарсить запрос в структурированный JSON:
-   - список позиций `items`;
-   - целевая валюта `target_currency`;
-   - (опционально) общий бюджет `budget`;
-   - (опционально) URL вебхука `webhook_url`.
-3. Агент дергает MCP-сервер `supplier-pricing-mcp.get_offers_for_items`:
-   - для каждой позиции подбираются офферы поставщиков;
-   - вычисляется минимальная возможная суммарная стоимость.
-4. Если валюта офферов отличается от целевой, агент вызывает `fx-rates-mcp.convert_amount`.
-5. Если задан вебхук — агент отправляет готовый план на `notification-mcp.send_procurement_plan_webhook`.
-6. Агент отдаёт:
-   - JSON-план (для интеграций и отладки),
-   - человекочитаемое резюме (для веб-чата).
+- `fx-rates-mcp/`  
+  MCP-сервер курса валют:
+  - `tools/convert_amount.py` — конвертация сумм:
+    - пробует внешний FX API с `FX_API_ACCESS_KEY`;
+    - если не получается — использует статический fallback-курс (например, USD→EUR).
 
-История диалога хранится на бэке (in-memory), поэтому можно писать:
-> «теперь добавь ещё 3 монитора»  
-и агент пересчитает общий план с учётом предыдущих сообщений.
+- `notification-mcp/`  
+  MCP-сервер уведомлений:
+  - `tools/send_procurement_plan_webhook.py` — POST JSON-плана на указанный URL.
 
----
+- `scripts/`  
+  Вспомогательные скрипты:
+  - отладка поискового MCP по поставщику (Printful/fakestore).
 
-## Технологии
-
-- **Python 3.12+**
-- **MCP** (`fastmcp`, `modelcontextprotocol`, `mcp.client.streamable_http`)
-- **OpenAI SDK** (`openai.AsyncOpenAI`)  
-  – можно работать как с `api.openai.com`, так и с OpenAI-совместимыми endpoint’ами, например Cloud.ru Foundation Models.
-- **FastAPI + Uvicorn** — веб-оболочка (чат).
-- **httpx** — HTTP-клиент для публичных API и вебхуков.
-- **pydantic v2** — типизация и валидация моделей данных.
-- **python-dotenv** — работа с `.env`.
+- `docker-compose.yaml`  
+  Оркестрация всех сервисов:
+  - поднимает MCP-серверы и агента;
+  - пробрасывает нужные порты.
 
 ---
 
-## Установка
+## Быстрый запуск через Docker Compose (рекомендуется)
 
-Рекомендуется единое виртуальное окружение для всего проекта.
+### 1. Клонируем репозиторий
 
 ```bash
-git clone <url_репозитория>
+git clone <URL_РЕПОЗИТОРИЯ> SMART-PROCUREMENT-AGENT
 cd SMART-PROCUREMENT-AGENT
-
-python -m venv .venv
-source .venv/bin/activate    # Linux / macOS
-# .venv\Scripts\activate     # Windows
-
-pip install --upgrade pip
 ```
 
-Установить зависимости (общий минимум):
+### 2. Создаём `.env` файлы
 
-```bash
-pip install \
-  fastapi uvicorn \
-  openai \
-  fastmcp modelcontextprotocol \
-  httpx \
-  pydantic \
-  python-dotenv \
-  prometheus-client \
-  opentelemetry-sdk opentelemetry-api
+#### `agent/.env`
+
+Минимально:
+
+```env
+# OpenAI
+OPENAI_API_KEY=sk-...
+
+# Опционально: своё имя модели
+OPENAI_MODEL_NAME=gpt-4.1-mini
+
+# Режим работы агента:
+# - planner (по умолчанию) — классический пайплайн: парсинг → MCP-вызовы → сводка.
+# - tools  — LLM сам решает, какие MCP-инструменты вызывать (tools-agent режим).
+AGENT_MODE=planner
 ```
 
-Или:
-```
-pip install -r requirements.txt
-```
-
----
-
-## Настройка окружения
-
-### 1. MCP-серверы
-
-В каждом каталоге MCP есть `.env.example`. Скопируй его в `.env` и при необходимости поправь значения.
+> В docker-compose URL-ы MCP уже задаются через `environment`, поэтому в `agent/.env`
+> достаточно ключа OpenAI и режима агента.
 
 #### `supplier-pricing-mcp/.env`
 
-```bash
-cd supplier-pricing-mcp
-cp .env.example .env
-```
-
-Пример содержимого:
-
 ```env
-SUPPLIER_API_BASE=https://fakestoreapi.com
-SUPPLIER_DEFAULT_CURRENCY=USD
-SUPPLIER_HTTP_TIMEOUT=10.0
+# Валюта поставщика
+SUPPLIER_CURRENCY=USD
 
-HOST=0.0.0.0
-PORT=8000
-LOG_LEVEL=INFO
+# Режим работы реального поставщика:
+# - true  — пытаться работать с Printful, если есть ключ и регион позволяет;
+# - false — сразу переходить к fakestoreapi.com (или demo-fallback).
+USE_PRINTFUL=false
+
+# Printful API (если доступен из региона)
+# PRINTFUL_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# PRINTFUL_API_BASE=https://api.printful.com
 ```
+
+Если `USE_PRINTFUL=true` и задан `PRINTFUL_API_KEY`, MCP сначала попробует Printful.  
+Если Printful недоступен (регион, сеть, ошибка) — MCP автоматически свалится в fakestoreapi.com.
 
 #### `fx-rates-mcp/.env`
 
-```bash
-cd fx-rates-mcp
-cp .env.example .env
-```
-
-Пример:
-
 ```env
-FX_API_BASE=https://api.exchangerate.host/latest
-FX_HTTP_TIMEOUT=10.0
-FX_DEFAULT_BASE_CURRENCY=RUB
+# Ключ внешнего FX API (опционально, в демо можно не задавать)
+# FX_API_ACCESS_KEY=xxxxxxx
 
-HOST=0.0.0.0
-PORT=8001
-LOG_LEVEL=INFO
+# Базовый URL внешнего FX API (пример — exchangerate.host или fxratesapi)
+# FX_API_BASE_URL=https://api.exchangerate.host/convert
 ```
+
+Если FX API не настроен или падает, `convert_amount` вернёт сумму с fallback-курсом
+(и отметит `provider=fallback_static`, `fallback_used=true`).
 
 #### `notification-mcp/.env`
 
-```bash
-cd notification-mcp
-cp .env.example .env
-```
-
-Пример:
+Можно оставить пустым или использовать под свои настройки логирования и т.п.:
 
 ```env
-NOTIFICATION_HTTP_TIMEOUT=10.0
-
-HOST=0.0.0.0
-PORT=8002
-LOG_LEVEL=INFO
+# Пока обязательных переменных нет
 ```
 
-> Для теста вебхуков удобно использовать [webhook.site](https://webhook.site) — просто подставь туда свой уникальный URL.
-
----
-
-### 2. Агент и LLM
-
-В каталоге `agent` создай `.env`:
+### 3. Запускаем всё через docker-compose
 
 ```bash
-cd agent
-cat > .env << 'EOF'
-OPENAI_API_KEY=sk-...                 # или токен Cloud.ru
-OPENAI_MODEL=gpt-4o-mini              # или другой, например gpt-4.1-mini
-
-# Если используешь Cloud.ru Foundation Models:
-# OPENAI_BASE_URL=https://foundation-models.api.cloud.ru/v1/
-
-# URL MCP-серверов (по умолчанию — локальные порты)
-SUPPLIER_MCP_URL=http://127.0.0.1:8000/mcp
-FX_MCP_URL=http://127.0.0.1:8001/mcp
-NOTIFICATION_MCP_URL=http://127.0.0.1:8002/mcp
-
-# Порт веб-интерфейса агента
-WEB_PORT=8080
-EOF
+docker compose up -d --build
 ```
 
----
-
-## Запуск end-to-end
-
-Открой **4 терминала** (или tmux-сессию) и подними всё по очереди.
-
-### 1. supplier-pricing-mcp
+Проверяем:
 
 ```bash
-cd supplier-pricing-mcp
-source ../.venv/bin/activate
-python server.py
-# Лог: "MCP Server: http://0.0.0.0:8000/mcp"
+docker compose ps
 ```
 
-### 2. fx-rates-mcp
-
-```bash
-cd fx-rates-mcp
-source ../.venv/bin/activate
-python server.py
-# MCP Server: http://0.0.0.0:8001/mcp
-```
-
-### 3. notification-mcp
-
-```bash
-cd notification-mcp
-source ../.venv/bin/activate
-python server.py
-# MCP Server: http://0.0.0.0:8002/mcp
-```
-
-### 4. Веб-оболочка агента
-
-```bash
-cd agent
-source ../.venv/bin/activate
-python web_app.py
-# FastAPI: http://0.0.0.0:8080
-```
-
-Затем открой в браузере:
+Ожидаемый результат (пример):
 
 ```text
-http://localhost:8080
+NAME                   IMAGE                                          COMMAND               SERVICE                STATUS         PORTS
+fx-rates-mcp           smart-procurement-agent-fx-rates-mcp           "python server.py"    fx-rates-mcp           Up            0.0.0.0:8001->8001/tcp
+notification-mcp       smart-procurement-agent-notification-mcp       "python server.py"    notification-mcp       Up            0.0.0.0:8002->8002/tcp
+procurement-agent      smart-procurement-agent-agent                  "python web_app.py"   agent                  Up            0.0.0.0:8080->8080/tcp
+supplier-pricing-mcp   smart-procurement-agent-supplier-pricing-mcp   "python server.py"    supplier-pricing-mcp   Up            0.0.0.0:8000->8000/tcp
 ```
 
----
+### 4. Открываем web-чат
 
-## Как пользоваться веб-чатйком
-
-1. Введите запрос в стиле:
-
-   > Нужно купить 10 ноутбуков среднего уровня до 80 000 ₽ за штуку  
-   > и 5 мониторов 27" до 25 000 ₽ за штуку.  
-   > Хочу видеть итоговую сумму в EUR и отправить план на вебхук https://webhook.site/...
-
-2. Агент:
-   - распарсит запрос;
-   - вызовет MCP-сервера;
-   - покажет ответ:
-     - краткое текстовое резюме,
-     - агрегированную сумму и количество позиций,
-     - кнопочку «Показать JSON-план закупки» (раскрывающийся блок с полным JSON).
-
-3. Можно продолжить диалог:
-
-   > Ок, добавь ещё 3 монитора, но уложись в общий бюджет 300 000 ₽.
-
-   Агент использует историю диалога (на бэке) и пересчитает план.
-
----
-
-## CLI-режим (без веба)
-
-Если хочешь протестировать только агента, можно запустить CLI:
-
-```bash
-cd agent
-source ../.venv/bin/activate
-python main.py
-```
-
-Дальше — вводишь запрос в консоли, агент печатает:
-
-- JSON-план закупки;
-- краткое резюме.
-
----
-
-## Структура каталогов (подробно)
+Локально:
 
 ```text
-SMART-PROCUREMENT-AGENT/
-├── agent/
-│   ├── main.py         # основной агент: LLM + вызовы MCP
-│   ├── web_app.py      # FastAPI-приложение с веб-чатйком
-│   ├── .env            # настройки агента (LLM + MCP_URL + WEB_PORT)
-│   └── ...             # вспомогательные файлы (по мере необходимости)
-│
-├── supplier-pricing-mcp/
-│   ├── server.py       # запуск MCP сервера (streamable-http)
-│   ├── mcp_instance.py # единый FastMCP()
-│   ├── tools/          # инструменты MCP: поиск офферов
-│   ├── .env.example
-│   └── .env
-│
-├── fx-rates-mcp/
-│   ├── server.py       # MCP сервер курсов валют
-│   ├── mcp_instance.py
-│   ├── tools/          # get_exchange_rate, convert_amount
-│   ├── .env.example
-│   └── .env
-│
-└── notification-mcp/
-    ├── server.py       # MCP сервер уведомлений
-    ├── mcp_instance.py
-    ├── tools/          # send_procurement_plan_webhook
-    ├── .env.example
-    └── .env
+http://localhost:8080/
+```
+
+Если развёрнуто на удалённой VM — `http://<PUBLIC_IP>:8080/`
+(или через домен/HTTPS, см. ниже).
+
+В веб-чате можно запросить, например:
+
+> Сделай мерч к конференции на 50 человек: худи, футболки и кружки, покажи итог в EUR
+
+Агент:
+
+1. распарсит запрос (позиции, количество, валюту, вебхук, бюджет);
+2. вызовет `supplier-pricing-mcp`:
+   - сначала попробует Printful (если включён),
+   - при необходимости свалится на fakestoreapi.com,
+3. посчитает сумму в валюте поставщика;
+4. через `fx-rates-mcp` переведёт в целевую валюту (EUR);
+5. при наличии webhook-URL вызовет `notification-mcp` и отправит JSON-план;
+6. вернёт:
+   - человекочитаемый текст (в markdown, рендерится на фронте),
+   - подробный JSON-план (можно раскрыть «Показать JSON-план закупки»).
+
+---
+
+## Режимы работы агента
+
+Агент поддерживает два режима (настраивается через `AGENT_MODE`):
+
+- `planner` (по умолчанию)  
+  Классический «оркестраторный» пайплайн:
+  - LLM парсит текст в структурированный запрос;
+  - Python-код сам вызывает `supplier-pricing-mcp`, `fx-rates-mcp`, `notification-mcp`;
+  - LLM делает финальную сводку по уже готовому плану.
+
+- `tools` (tools-agent режим)  
+  Агент отдаёт LLM-модели список MCP-инструментов, и она сама решает,
+  какие вызывать и в каком порядке, используя OpenAI tools:
+  - более «автономный» режим;
+  - удобно для демонстрации, как LLM сама режиссирует MCP-вызовы.
+
+Переключение:
+
+```env
+AGENT_MODE=planner   # или tools
 ```
 
 ---
 
-## Что можно доработать
+## Как устроен поставщик (supplier-pricing-mcp)
 
-Идеи для дальнейшего развития:
+В `tools/get_offers_for_items.py` реализован каскад:
 
-- заменить in-memory историю диалогов на Redis/БД;
-- добавить аутентификацию и многопользовательский режим;
-- поддержать реальные API поставщиков (ERP, маркетплейсы, внутренние REST-сервисы);
-- хранить и визуализировать историю планов закупок;
-- добавить графики (динамика цен, экономия vs бюджет и т.д.).
+1. **Printful**  
+   Если `USE_PRINTFUL=true` и есть `PRINTFUL_API_KEY`:
+   - по каждому `sku` строится текстовый запрос (например, `"hoodie"`, `"t-shirt"`, `"mug"`);
+   - через Printful Catalog API ищется подходящий product/variant;
+   - выбирается один вариант и формируется оффер:
+     ```json
+     {
+       "supplier": "printful",
+       "sku": "hoodie",
+       "unit_price": 12.34,
+       "currency": "USD",
+       "variant_id": 20556,
+       "description": "Gildan 18500 Unisex Heavy Blend Hoodie ..."
+     }
+     ```
+
+2. **FakeStore fallback**  
+   Если Printful недоступен (регион, сеть, ошибка) или отключён:
+   - MCP идёт в `https://fakestoreapi.com/products`;
+   - подбирает «лучший» товар по простому скорингу названия/категории;
+   - отдаёт оффер с `supplier="fakestoreapi"`.
+
+3. **Demo-fallback**  
+   Если не достучались ни до Printful, ни до fakestoreapi:
+   - возвращается структура с `total_min_cost=0.0`,
+   - все позиции попадают в `unavailable_skus`,
+   - `provider="demo_fallback"`, `fallback_used=true`.
+
+Все режимы возвращают один и тот же формат `structuredContent`, чтобы
+агенту и фронту не приходилось различать источники.
 
 ---
 
+## FX-курс (fx-rates-mcp)
+
+`tools/convert_amount.py`:
+
+- пытается дернуть внешний FX API (настраивается через `.env`, например `FX_API_ACCESS_KEY`);
+- если:
+  - ключ не задан,
+  - API вернул ошибку,
+  - не нашлась нужная пара,
+
+  то MCP возвращает конвертацию по **запасному курсу** (fallback) и помечает это в ответе:
+
+```json
+{
+  "base": "USD",
+  "quote": "EUR",
+  "amount_base": 123.45,
+  "amount_quote": 111.11,
+  "rate": 0.90,
+  "provider": "fallback_static",
+  "fallback_used": true,
+  "warning": "FX API не вернул корректный курс, использован fallback-курс (fallback_static).",
+  "raw": { ... }
+}
+```
+
+Агент пересчитывает сумму по этому курсу, но в UI можно подсветить,
+что это приблизительное значение.
+
+---
+
+## Notification-MCP
+
+`notification-mcp/tools/send_procurement_plan_webhook.py`:
+
+- принимает:
+  - `url` — строка с вебхуком;
+  - `plan` — JSON-план закупки;
+- делает HTTP `POST` с `application/json`;
+- возвращает:
+  - статус ответа (`status_code`, `ok`),
+  - тело ответа (если есть).
+
+Если пользователь в запросе не указал вебхук — MCP не вызывается, план просто строится и показывается.
+
+---
+
+## Локальный запуск без Docker (для разработки)
+
+Если хочешь крутить всё руками:
+
+1. Установи зависимости в каждом модуле (`agent/`, `supplier-pricing-mcp/`, …):
+
+   ```bash
+   cd agent
+   pip install -r requirements.txt
+   ```
+
+2. Запусти MCP-серверы в отдельных терминалах:
+
+   ```bash
+   cd supplier-pricing-mcp
+   python server.py
+
+   cd fx-rates-mcp
+   python server.py
+
+   cd notification-mcp
+   python server.py
+   ```
+
+3. Запусти агента:
+
+   ```bash
+   cd agent
+   python web_app.py
+   ```
+
+И далее всё так же открываешь `http://localhost:8080/`.
+
+---
+
+## Продакшен-деплой (кратко)
+
+Для продакшена (например, на Ubuntu 22.04 с публичным IP):
+
+1. Скопировать репозиторий на сервер.
+2. Настроить `.env` файлы (как в секции выше).
+3. Запустить:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+4. Поставить **nginx** как reverse-proxy:
+   - слушает `80/443`,
+   - проксирует на `http://127.0.0.1:8080`.
+5. Выпустить Let’s Encrypt-сертификат через `certbot --nginx`
+   для домена вроде `smart_procurement_agent.ru`.
+
+После этого агент будет доступен по HTTPS по красивому доменному имени.
+
+---
+
+## Дальнейшее развитие
+
+Идеи, как развивать проект:
+
+- Добавить ещё MCP-серверы:
+  - ERP/CRM,
+  - реальных локальных поставщиков с публичными API,
+  - внутренние справочники компаний.
+- Усложнить стратегию подбора:
+  - несколько поставщиков,
+  - мультивалютные прайсы,
+  - ограничения по срокам поставки.
+- Сохранение истории и планов в базу (PostgreSQL/SQLite).
+- Авторизация / multitenancy / организация по отделам.
+
+Но уже в текущем виде проект демонстрирует:
+
+- **мультиагентную архитектуру через MCP**,
+- **интеграцию с реальными и публичными API (Printful / fakestore)**,
+- **бизнес-сценарий закупок** с автоматизацией от текста до плана и вебхука.
